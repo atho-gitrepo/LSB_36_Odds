@@ -3,13 +3,10 @@ import os
 import json
 import time
 import logging
-import threading
-from datetime import datetime, timezone
-from urllib.parse import urlencode
+from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
 from esd.sofascore import SofascoreClient
-import websocket
 
 # --- LOGGING ---
 logging.basicConfig(
@@ -46,7 +43,6 @@ MATCH_CACHE = {}           # smart tracking cache
 SOFASCORE_CLIENT = None
 firebase_manager = None
 LOCAL_TRACKED_MATCHES = {}
-GLOBAL_ODDS_CLIENT = None  # Holds the running WebSocket background stream
 
 # =========================
 # FIREBASE
@@ -128,7 +124,7 @@ def calculate_stake():
     return ORIGINAL_STAKE, 1
 
 # =========================
-# 🧠 NEW: SMART PREDICTION ENGINE
+# 🧠 SMART PREDICTION ENGINE
 # =========================
 def should_pre_warm(minute):
     return minute >= PREDICT_START_MIN
@@ -137,121 +133,29 @@ def is_in_active_window(minute):
     return PRE_WARM_WINDOW[0] <= minute <= PRE_WARM_WINDOW[1]
 
 # =========================
-# INTEGRATED WEBSOCKET REAL-TIME STREAM CLIENT
+# JUST-IN-TIME ODDS (REST API BACKUP)
 # =========================
-class OddsWebSocketClient:
-    def __init__(self, api_key, markets, sport=None, leagues=None, status=None, bookmakers=None):
-        self.api_key = api_key
-        self.markets = markets
-        self.sport = sport
-        self.leagues = leagues
-        self.status = status
-        self.bookmakers = bookmakers
-        self.ws = None
-        self.should_reconnect = True
-        self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 10
-        self._reconnect_timer = None
-        self.last_seq = 0
-        self.odds_store = {}  # Cache structure: { "Home vs Away": { "Bet365": 2.10, "1xBet": 2.15 } }
-
-    def build_url(self):
-        params = {"apiKey": self.api_key, "markets": self.markets}
-        if self.sport: params["sport"] = self.sport
-        if self.leagues: params["leagues"] = self.leagues
-        if self.status: params["status"] = self.status
-        if self.last_seq > 0: params["lastSeq"] = str(self.last_seq)
-        return f"wss://api.odds-api.io/v3/ws?{urlencode(params)}"
-
-    def on_message(self, ws, message):
-        for line in message.strip().split('\n'):
-            line = line.strip()
-            if not line: continue
-            try:
-                self._handle_parsed(json.loads(line))
-            except Exception as e:
-                logger.error(f"WebSocket parser error: {e}")
-
-    def _handle_parsed(self, data):
-        msg_type = data.get('type')
-        seq = data.get('seq')
-        if seq and seq > self.last_seq:
-            self.last_seq = seq
-
-        if msg_type in ('created', 'updated'):
-            home = data.get('home', '')
-            away = data.get('away', '')
-            if not home or not away: return
-            
-            match_key = f"{home.lower()} vs {away.lower()}"
-            bookie = data.get('bookie', '')
-            
-            if bookie in BOOKMAKERS_TO_CHECK:
-                if match_key not in self.odds_store:
-                    self.odds_store[match_key] = {}
-                
-                for market in data.get('markets', []):
-                    if market.get('name') in ['ML', 'h2h']:
-                        for outcome in market.get('odds', []):
-                            if outcome.get('name', '').lower() in ['draw', 'x']:
-                                self.odds_store[match_key][bookie] = float(outcome.get('odds', 0.0))
-
-        elif msg_type == 'deleted':
-            home = data.get('home', '')
-            away = data.get('away', '')
-            match_key = f"{home.lower()} vs {away.lower()}"
-            self.odds_store.pop(match_key, None)
-
-    def on_error(self, ws, error):
-        logger.error(f"WebSocket error: {error}")
-
-    def on_close(self, ws, close_status_code, close_msg):
-        logger.warning(f"WebSocket disconnected. Reconnecting...")
-        if self.should_reconnect:
-            self.reconnect_attempts += 1
-            if self.reconnect_attempts <= self.max_reconnect_attempts:
-                delay = min(2 ** (self.reconnect_attempts - 1), 30)
-                self._reconnect_timer = threading.Timer(delay, self._start_ws)
-                self._reconnect_timer.daemon = True
-                self._reconnect_timer.start()
-
-    def on_open(self, ws):
-        logger.info("✅ Live Odds WebSocket Feed Connected successfully.")
-        self.reconnect_attempts = 0
-
-    def _start_ws(self):
-        self.ws = websocket.WebSocketApp(
-            self.build_url(),
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
-        ws_thread = threading.Thread(target=self.ws.run_forever, kwargs={"ping_interval": 30, "ping_timeout": 10})
-        ws_thread.daemon = True
-        ws_thread.start()
-
-    def start(self):
-        self._start_ws()
-
-    def lookup_cached_odds(self, home_team, away_team):
-        """Cross-references Sofascore strings with WebSocket cache objects using clean normalization."""
-        h_clean = home_team.lower()
-        a_clean = away_team.lower()
-        
-        # Exact match verification
-        direct_key = f"{h_clean} vs {a_clean}"
-        if direct_key in self.odds_store:
-            return self.odds_store[direct_key]
-            
-        # Segment search fallback for dynamic naming structures
-        for stored_key, odds in self.odds_store.items():
-            if h_clean in stored_key or a_clean in stored_key:
-                return odds
-        return {}
+def fetch_odds_triggered(home_team, away_team):
+    """Fallback JIT fetching using REST API to prevent 403 WebSocket restrictions."""
+    since = int(time.time()) - 60
+    results = {'Bet365': 0.0, '1xBet': 0.0}
+    
+    for bkr in BOOKMAKERS_TO_CHECK:
+        url = f"https://api.odds-api.io/v3/odds/updated?apiKey={ODDS_API_KEY}&since={since}&bookmaker={bkr}&sport=Football"
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for match_odds in data.get('odds', []):
+                    if home_team.lower() in match_odds['home'].lower() or away_team.lower() in match_odds['away'].lower():
+                        draw_odds = next((o['odds'] for o in match_odds.get('outcomes', []) if o['name'].lower() in ['draw', 'x']), 0.0)
+                        results[bkr] = float(draw_odds)
+        except Exception as e:
+            logger.error(f"REST API fallback error for {bkr}: {e}")
+    return results
 
 # =========================
-# MATCH PROCESS (UPDATED SMART)
+# MATCH PROCESS
 # =========================
 def process_match(match):
     fid = str(match.id)
@@ -270,38 +174,31 @@ def process_match(match):
 
     match_name = f"{match.home_team.name} vs {match.away_team.name}"
 
-    # =========================
-    # 🧠 SMART PRE-WARM LOGIC (NEW)
-    # =========================
     if not should_pre_warm(min_elapsed):
-        return  # skip early matches completely
+        return
 
-    # cache tracking
     state = LOCAL_TRACKED_MATCHES.get(fid, {
         'bet_placed': False,
         'last_seen': time.time(),
         'active': False
     })
-
     state['last_seen'] = time.time()
 
-    # activate only near window
     if is_in_active_window(min_elapsed):
         state['active'] = True
 
     LOCAL_TRACKED_MATCHES[fid] = state
 
     # =========================
-    # 1. PLACE BET (UNCHANGED LOGIC)
+    # 1. PLACE BET (TRIGGER DRIVEN)
     # =========================
     if '1ST' in status and min_elapsed in MINUTES_REGULAR_BET and not state['bet_placed']:
         if not firebase_manager.is_state_locked():
             if score in ['1-1', '2-2', '3-3']:
                 
-                # --- INSTANT IN-MEMORY LOCAL DATA EXTRACTION ---
-                odds_data = {}
-                if GLOBAL_ODDS_CLIENT:
-                    odds_data = GLOBAL_ODDS_CLIENT.lookup_cached_odds(match.home_team.name, match.away_team.name)
+                # --- CALLED ONLY ONCE PER MATCH CRITERIA TRIGGER ---
+                logger.info(f"🎯 Match Strategy Triggered for {match_name}. Polling REST endpoints...")
+                odds_data = fetch_odds_triggered(match.home_team.name, match.away_team.name)
                 
                 stake, seq = calculate_stake()
                 data = {
@@ -319,13 +216,13 @@ def process_match(match):
 
                 send_telegram(
                     f"🎯 **BET PLACED (Match {seq})**\n⏱ {min_elapsed}' | {match_name}\n🌍 {country} | 🏆 {league}\n🔢 Score: {score}\n💰 Stake: ${stake:.2f}\n"
-                    f"📈 WebSocket Feed -> Bet365: {data['odds_bet365']} | 1xBet: {data['odds_1xbet']}"
+                    f"📈 JIT Feed -> Bet365: {data['odds_bet365']} | 1xBet: {data['odds_1xbet']}"
                 )
 
         state['bet_placed'] = True
 
     # =========================
-    # 2. HT CHECK (UNCHANGED LOGIC)
+    # 2. HT CHECK
     # =========================
     elif 'HALFTIME' in status:
         unresolved = firebase_manager.get_unresolved_bet(fid)
@@ -333,7 +230,6 @@ def process_match(match):
         if unresolved:
             outcome = 'win' if score == unresolved['36_score'] else 'loss'
             
-            # Select best price from captured snapshot fields for performance analytics
             execution_odds = max(unresolved.get('odds_bet365', 0.0), unresolved.get('odds_1xbet', 0.0))
             stake = unresolved.get('stake', 0.0)
             
@@ -361,21 +257,8 @@ def process_match(match):
 # INIT
 # =========================
 def initialize_bot_services():
-    global firebase_manager, SOFASCORE_CLIENT, GLOBAL_ODDS_CLIENT
+    global firebase_manager, SOFASCORE_CLIENT
     firebase_manager = FirebaseManager(FIREBASE_CREDENTIALS)
-
-    # Initialize and spin up WebSocket Feed in background thread
-    try:
-        GLOBAL_ODDS_CLIENT = OddsWebSocketClient(
-            api_key=ODDS_API_KEY,
-            markets="ML",
-            sport="football",
-            status="live"
-        )
-        GLOBAL_ODDS_CLIENT.start()
-        logger.info("✅ Live Streaming Infrastructure Initialized.")
-    except Exception as e:
-        logger.error(f"Failed to load background web stream: {e}")
 
     try:
         SOFASCORE_CLIENT = SofascoreClient()
@@ -396,7 +279,7 @@ def shutdown_bot():
             pass
 
 # =========================
-# MAIN CYCLE (OPTIMIZED)
+# MAIN CYCLE
 # =========================
 def run_bot_cycle():
     if not SOFASCORE_CLIENT:
@@ -404,13 +287,11 @@ def run_bot_cycle():
 
     try:
         events = SOFASCORE_CLIENT.get_events(live=True)
-
         if not events:
             logger.warning("No events received")
             return
 
         logger.info(f"Scanning {len(events)} live matches")
-
         for m in events:
             process_match(m)
 
