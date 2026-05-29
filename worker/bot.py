@@ -20,12 +20,14 @@ logger = logging.getLogger("BetBot")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "YOUR_API_KEY_HERE")
 
 # --- SETTINGS ---
 ORIGINAL_STAKE = 10.0
 MAX_CHASE_LEVEL = 4
 SLEEP_TIME = 95
 MINUTES_REGULAR_BET = [35,36,37]
+BOOKMAKERS_TO_CHECK = ['Bet365', '1xBet']
 
 # --- FILTERS ---
 ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League']
@@ -131,6 +133,29 @@ def is_in_active_window(minute):
     return PRE_WARM_WINDOW[0] <= minute <= PRE_WARM_WINDOW[1]
 
 # =========================
+# EXTRA FEATURE: JUST-IN-TIME ODDS
+# =========================
+def fetch_odds_triggered(home_team, away_team):
+    """Fetches odds updated in the last 60 seconds specifically for Bet365 and 1xBet."""
+    since = int(time.time()) - 60
+    results = {'Bet365': 0.0, '1xBet': 0.0}
+    
+    for bkr in BOOKMAKERS_TO_CHECK:
+        url = f"https://api.odds-api.io/v3/odds/updated?apiKey={ODDS_API_KEY}&since={since}&bookmaker={bkr}&sport=Football"
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for match_odds in data.get('odds', []):
+                    # Direct and basic fuzzy verification for team name strings
+                    if home_team.lower() in match_odds['home'].lower() or away_team.lower() in match_odds['away'].lower():
+                        draw_odds = next((o['odds'] for o in match_odds.get('outcomes', []) if o['name'].lower() in ['draw', 'x']), 0.0)
+                        results[bkr] = float(draw_odds)
+        except Exception as e:
+            logger.error(f"Odds API Error for {bkr}: {e}")
+    return results
+
+# =========================
 # MATCH PROCESS (UPDATED SMART)
 # =========================
 def process_match(match):
@@ -177,6 +202,10 @@ def process_match(match):
     if '1ST' in status and min_elapsed in MINUTES_REGULAR_BET and not state['bet_placed']:
         if not firebase_manager.is_state_locked():
             if score in ['1-1', '2-2', '3-3']:
+                
+                # --- LIVE EXTRACTION ONLY AT STRATEGY TRIGGER TIME ---
+                odds_data = fetch_odds_triggered(match.home_team.name, match.away_team.name)
+                
                 stake, seq = calculate_stake()
                 data = {
                     'match_name': match_name,
@@ -184,13 +213,20 @@ def process_match(match):
                     '36_score': score,
                     'stake': stake,
                     'match_sequence': seq,
-                    'bet_type': 'regular'
+                    'bet_type': 'regular',
+                    'odds_bet365': odds_data.get('Bet365', 0.0),
+                    'odds_1xbet': odds_data.get('1xBet', 0.0)
                 }
 
                 firebase_manager.add_unresolved_bet(fid, data)
 
                 send_telegram(
-                    f"🎯 **BET PLACED (Match {seq})**\n⏱ 36' | {match_name}\n🌍 {country} | 🏆 {league}\n🔢 Score: {score}\n💰 Stake: ${stake:.2f}"
+                    f"🎯 **BET PLACED (Match {seq})**\n"
+                    f"⏱ {min_elapsed}' | {match_name}\n"
+                    f"🌍 {country} | 🏆 {league}\n"
+                    f"🔢 Score: {score}\n"
+                    f"💰 Stake: ${stake:.2f}\n"
+                    f"📈 Bet365: {data['odds_bet365']} | 1xBet: {data['odds_1xbet']}"
                 )
 
         state['bet_placed'] = True
@@ -203,10 +239,31 @@ def process_match(match):
 
         if unresolved:
             outcome = 'win' if score == unresolved['36_score'] else 'loss'
+            
+            # Select the highest execution market price available for analytical valuation calculations
+            execution_odds = max(unresolved.get('odds_bet365', 0.0), unresolved.get('odds_1xbet', 0.0))
+            stake = unresolved.get('stake', 0.0)
+            
+            if outcome == 'win':
+                pnl = (stake * execution_odds) - stake if execution_odds > 0 else 0.0
+            else:
+                pnl = -stake
+                
+            # Enrich original structural map with dashboard-friendly properties
+            unresolved.update({
+                'final_ht_score': score,
+                'pnl': round(pnl, 2),
+                'bet_odds_used': execution_odds,
+                'roi_percentage': round((pnl / stake) * 100, 2) if stake > 0 else 0.0
+            })
+
             firebase_manager.move_to_resolved(fid, unresolved, outcome)
 
             send_telegram(
-                f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} HT\n{match_name}\nScore: {score}"
+                f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} HT\n"
+                f"{match_name}\n"
+                f"Score: {score}\n"
+                f"📊 PnL: ${unresolved['pnl']:.2f} ({unresolved['roi_percentage']}% ROI)"
             )
 
             LOCAL_TRACKED_MATCHES.pop(fid, None)
@@ -256,4 +313,4 @@ def run_bot_cycle():
             process_match(m)
 
     except Exception as e:
-        logger.error(f"Cycle Error: {e}")
+        logger.error(f"Error in execution loop: {e}")
