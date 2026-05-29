@@ -133,29 +133,33 @@ def is_in_active_window(minute):
     return PRE_WARM_WINDOW[0] <= minute <= PRE_WARM_WINDOW[1]
 
 # =========================
-# JUST-IN-TIME ODDS (REST API BACKUP)
+# JUST-IN-TIME ODDS (TARGETED 1ST HALF MARKETS)
 # =========================
 def fetch_odds_triggered(home_team, away_team):
-    """Fallback JIT fetching using REST API to prevent 403 WebSocket restrictions."""
+    """
+    Just-In-Time fetching using REST API targeting 1st Half Draw markets explicitly.
+    """
     since = int(time.time()) - 60
     results = {'Bet365': 0.0, '1xBet': 0.0}
     
     for bkr in BOOKMAKERS_TO_CHECK:
-        url = f"https://api.odds-api.io/v3/odds/updated?apiKey={ODDS_API_KEY}&since={since}&bookmaker={bkr}&sport=Football"
+        # Appended &market=1st_half_h2h to target first-half-only betting lines
+        url = f"https://api.odds-api.io/v3/odds/updated?apiKey={ODDS_API_KEY}&since={since}&bookmaker={bkr}&sport=Football&market=1st_half_h2h"
         try:
             resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 for match_odds in data.get('odds', []):
                     if home_team.lower() in match_odds['home'].lower() or away_team.lower() in match_odds['away'].lower():
+                        # Extract the outcome value matching the 'draw' or 'x' fields within the 1st Half Market Array
                         draw_odds = next((o['odds'] for o in match_odds.get('outcomes', []) if o['name'].lower() in ['draw', 'x']), 0.0)
                         results[bkr] = float(draw_odds)
         except Exception as e:
-            logger.error(f"REST API fallback error for {bkr}: {e}")
+            logger.error(f"REST API 1st Half fetch error for {bkr}: {e}")
     return results
 
 # =========================
-# MATCH PROCESS
+# MATCH PROCESS (UPDATED SMART)
 # =========================
 def process_match(match):
     fid = str(match.id)
@@ -174,16 +178,22 @@ def process_match(match):
 
     match_name = f"{match.home_team.name} vs {match.away_team.name}"
 
+    # =========================
+    # 🧠 SMART PRE-WARM LOGIC (NEW)
+    # =========================
     if not should_pre_warm(min_elapsed):
-        return
+        return  # skip early matches completely
 
+    # cache tracking
     state = LOCAL_TRACKED_MATCHES.get(fid, {
         'bet_placed': False,
         'last_seen': time.time(),
         'active': False
     })
+
     state['last_seen'] = time.time()
 
+    # activate only near window
     if is_in_active_window(min_elapsed):
         state['active'] = True
 
@@ -196,8 +206,8 @@ def process_match(match):
         if not firebase_manager.is_state_locked():
             if score in ['1-1', '2-2', '3-3']:
                 
-                # --- CALLED ONLY ONCE PER MATCH CRITERIA TRIGGER ---
-                logger.info(f"🎯 Match Strategy Triggered for {match_name}. Polling REST endpoints...")
+                # --- POLLING 1ST HALF LINES AT TRIGGER TIME ONLY ---
+                logger.info(f"🎯 Match Strategy Triggered for {match_name}. Extracting 1st Half Odds...")
                 odds_data = fetch_odds_triggered(match.home_team.name, match.away_team.name)
                 
                 stake, seq = calculate_stake()
@@ -216,13 +226,13 @@ def process_match(match):
 
                 send_telegram(
                     f"🎯 **BET PLACED (Match {seq})**\n⏱ {min_elapsed}' | {match_name}\n🌍 {country} | 🏆 {league}\n🔢 Score: {score}\n💰 Stake: ${stake:.2f}\n"
-                    f"📈 JIT Feed -> Bet365: {data['odds_bet365']} | 1xBet: {data['odds_1xbet']}"
+                    f"📈 1st Half Draw Odds -> Bet365: {data['odds_bet365']} | 1xBet: {data['odds_1xbet']}"
                 )
 
         state['bet_placed'] = True
 
     # =========================
-    # 2. HT CHECK
+    # 2. HT CHECK (UNCHANGED LOGIC)
     # =========================
     elif 'HALFTIME' in status:
         unresolved = firebase_manager.get_unresolved_bet(fid)
@@ -230,6 +240,7 @@ def process_match(match):
         if unresolved:
             outcome = 'win' if score == unresolved['36_score'] else 'loss'
             
+            # Analytics: Use highest available matched price variant for performance analysis
             execution_odds = max(unresolved.get('odds_bet365', 0.0), unresolved.get('odds_1xbet', 0.0))
             stake = unresolved.get('stake', 0.0)
             
@@ -237,7 +248,8 @@ def process_match(match):
                 pnl = (stake * execution_odds) - stake if execution_odds > 0 else 0.0
             else:
                 pnl = -stake
-
+                
+            # Enrich object model for database streaming
             unresolved.update({
                 'final_ht_score': score,
                 'pnl': round(pnl, 2),
@@ -248,7 +260,8 @@ def process_match(match):
             firebase_manager.move_to_resolved(fid, unresolved, outcome)
 
             send_telegram(
-                f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} HT\n{match_name}\nScore: {score}\n💵 PnL: ${unresolved['pnl']:.2f}"
+                f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} HT\n{match_name}\n"
+                f"Score: {score}\n📊 PnL: ${unresolved['pnl']:.2f} ({unresolved['roi_percentage']}% ROI)"
             )
 
             LOCAL_TRACKED_MATCHES.pop(fid, None)
@@ -279,7 +292,7 @@ def shutdown_bot():
             pass
 
 # =========================
-# MAIN CYCLE
+# MAIN CYCLE (OPTIMIZED)
 # =========================
 def run_bot_cycle():
     if not SOFASCORE_CLIENT:
@@ -287,13 +300,15 @@ def run_bot_cycle():
 
     try:
         events = SOFASCORE_CLIENT.get_events(live=True)
+
         if not events:
             logger.warning("No events received")
             return
 
         logger.info(f"Scanning {len(events)} live matches")
+
         for m in events:
             process_match(m)
 
     except Exception as e:
-        logger.error(f"Loop run structural fault encountered: {e}")
+        logger.error(f"Error in execution loop: {e}")
