@@ -58,4 +58,7 @@ COPY . /app/
 # ----------------------------------------------------
 # 7. START COMMAND
 # ----------------------------------------------------
-CMD ["python","-u", "worker/main.py"]
+# Unbuffers python output so your logs stream instantly to the console
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "worker/main.py"]
