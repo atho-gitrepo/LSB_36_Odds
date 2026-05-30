@@ -200,6 +200,8 @@ def run_prematch_scan_cycle():
             
     except Exception as e:
         logger.error(f"[SCAN_CYCLE] ❌ Error during execution: {e}", exc_info=True)
+# Backward compatibility alias for main.py execution linkage
+run_bot_cycle = run_prematch_scan_cycle
 
 if __name__ == "__main__":
     logger.info("🎬 Launching Pre-Match Win Probability Bot...")
