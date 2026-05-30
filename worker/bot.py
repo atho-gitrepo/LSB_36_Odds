@@ -134,7 +134,6 @@ def get_live_1st_half_corners(match_id):
     the exact 1st half corner totals using your match_stats data model fields.
     """
     try:
-        # Request full statistics payload using the event ID
         stats_data = SOFASCORE_CLIENT.get_stats(match_id)
         if not stats_data or not hasattr(stats_data, 'first_half') or stats_data.first_half is None:
             return 0
@@ -189,7 +188,6 @@ def process_match(match):
         if not firebase_manager.is_state_locked():
             
             if score in ['1-1', '2-2', '3-3']:
-                # Pull correct corner values directly from match_stats.py schema model
                 current_total_corners = get_live_1st_half_corners(fid)
                 target_corner_line = float(current_total_corners + 0.5)
 
@@ -223,16 +221,11 @@ def process_match(match):
         unresolved = firebase_manager.get_unresolved_bet(fid)
 
         if unresolved:
-            # Query fresh final half-time statistics payload
             final_ht_corners = get_live_1st_half_corners(fid)
 
-            # Leg 1: Trigger score matches the final half-time scoreline
             score_leg_win = (score == unresolved['trigger_score'])
-            
-            # Leg 2: Total corners taken at halftime exceeds our +0.5 goal threshold line
             corner_leg_win = (float(final_ht_corners) > unresolved['target_corner_line'])
 
-            # Parlay win conditions met
             parlay_win = score_leg_win and corner_leg_win
             outcome = 'win' if parlay_win else 'loss'
             
