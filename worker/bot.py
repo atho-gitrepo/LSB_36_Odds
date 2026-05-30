@@ -12,33 +12,29 @@ from esd.sofascore import SofascoreClient
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("bot_activity.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("win_prob_bot.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("BetBot")
+logger = logging.getLogger("WinProbBot")
 
 # --- ENV VARS ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
 
-# --- SETTINGS ---
-ORIGINAL_STAKE = 10.0
-MAX_CHASE_LEVEL = 4
-SLEEP_TIME = 95
-MINUTES_REGULAR_BET = [35, 36, 37]
+# --- CONFIGURATION SETTINGS ---
+SLEEP_TIME = 120  
+MIN_PROBABILITY_THRESHOLD = 70.0  
+MIN_MINUTES_ELAPSED = 15  
 
-# --- FILTERS ---
+# --- LEAGUE FILTERS ---
 ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League', 'Copa Colombia']
 EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'Friendly']
 AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u1', 'u23', 'u21', 'u20', 'women', 'college']
 
-# --- SMART OPTIMIZATION SETTINGS ---
-PREDICT_START_MIN = 30     
-PRE_WARM_WINDOW = (34, 38) 
 LOCAL_TRACKED_MATCHES = {}
 
 # =========================
-# FIREBASE
+# FIREBASE STORAGE
 # =========================
 class FirebaseManager:
     def __init__(self, creds_json):
@@ -56,42 +52,30 @@ class FirebaseManager:
         except Exception as e:
             logger.error(f"❌ Firebase Init Error: {e}")
 
-    def is_state_locked(self):
-        try:
-            return len(self.db.collection('unresolved_bets').limit(1).get()) > 0
-        except:
-            return False
+    def add_unresolved_probability_bet(self, match_id, data):
+        """Saves high probability predictions that are still running."""
+        data['logged_at'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        if self.db:
+            self.db.collection('unresolved_prob_bets').document(str(match_id)).set(data)
 
-    def get_last_resolved_bet(self):
-        try:
-            query = self.db.collection('resolved_bets')\
-                .order_by('resolution_timestamp', direction=firestore.Query.DESCENDING)\
-                .limit(1).get()
-            for doc in query:
-                return doc.to_dict()
-        except:
-            return None
-
-    def add_unresolved_bet(self, match_id, data):
-        data['placed_at'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        self.db.collection('unresolved_bets').document(str(match_id)).set(data)
-
-    def get_unresolved_bet(self, match_id):
-        doc = self.db.collection('unresolved_bets').document(str(match_id)).get()
+    def get_unresolved_probability_bet(self, match_id):
+        if not self.db: return None
+        doc = self.db.collection('unresolved_prob_bets').document(str(match_id)).get()
         return doc.to_dict() if doc.exists else None
 
-    def move_to_resolved(self, match_id, data, outcome):
+    def move_to_resolved_probability_bet(self, match_id, data, outcome):
+        """Moves completed match results to historical logs and purges active references."""
+        if not self.db: return
         data.update({
             'outcome': outcome,
             'resolved_at': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
             'resolution_timestamp': firestore.SERVER_TIMESTAMP
         })
-        self.db.collection('resolved_bets').document(str(match_id)).set(data)
-        self.db.collection('unresolved_bets').document(str(match_id)).delete()
-        return True
+        self.db.collection('resolved_prob_bets').document(str(match_id)).set(data)
+        self.db.collection('unresolved_prob_bets').document(str(match_id)).delete()
 
 # =========================
-# TELEGRAM
+# TELEGRAM NOTIFIER
 # =========================
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -101,55 +85,12 @@ def send_telegram(msg):
             data={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'},
             timeout=15
         )
-    except:
-        pass
-
-# =========================
-# STAKE
-# =========================
-def calculate_stake():
-    last = firebase_manager.get_last_resolved_bet()
-    if not last or last.get('outcome') == 'win':
-        return ORIGINAL_STAKE, 1
-    seq = last.get('match_sequence', 1)
-    if seq < MAX_CHASE_LEVEL:
-        return float(ORIGINAL_STAKE * (2**seq)), seq + 1
-    return ORIGINAL_STAKE, 1
-
-# =========================
-# SMART PREDICTION ENGINE
-# =========================
-def should_pre_warm(minute):
-    return minute >= PREDICT_START_MIN
-
-def is_in_active_window(minute):
-    return PRE_WARM_WINDOW[0] <= minute <= PRE_WARM_WINDOW[1]
-
-# ==========================================
-# SAFE CORNER EXTRACTION FUNCTION
-# ==========================================
-def get_live_1st_half_corners(match_id):
-    """
-    Queries SofascoreClient statistics payload directly and extracts
-    the exact 1st half corner totals using your match_stats data model fields.
-    """
-    try:
-        stats_data = SOFASCORE_CLIENT.get_stats(match_id)
-        if not stats_data or not hasattr(stats_data, 'first_half') or stats_data.first_half is None:
-            return 0
-            
-        corner_item = stats_data.first_half.match_overview.corner_kicks
-        home_corners = corner_item.home_total if corner_item.home_total is not None else 0
-        away_corners = corner_item.away_total if corner_item.away_total is not None else 0
-        
-        return int(home_corners + away_corners)
     except Exception as e:
-        logger.error(f"Error fetching Sofascore deep stats for match {match_id}: {e}")
-        return 0
+        logger.error(f"Telegram error: {e}")
 
-# =========================
-# MATCH PROCESS
-# =========================
+# ==========================================
+# WIN PROBABILITY ANALYSIS CORE
+# ==========================================
 def process_match(match):
     fid = str(match.id)
     league = match.tournament.name
@@ -162,100 +103,121 @@ def process_match(match):
 
     min_elapsed = match.total_elapsed_minutes
     status = match.status.description.upper()
-    score = f"{match.home_score.current}-{match.away_score.current}"
+    
+    home_score = match.home_score.current if match.home_score else 0
+    away_score = match.away_score.current if match.away_score else 0
+    score_str = f"{home_score}-{away_score}"
+    
     match_name = f"{match.home_team.name} vs {match.away_team.name}"
 
-    if not should_pre_warm(min_elapsed):
-        return  
+    # ----------------------------------------------------
+    # PHASE 1: EVALUATING ACTIVE LIVE MATCHES FOR TRIPPERS
+    # ----------------------------------------------------
+    if ('1ST' in status or '2ND' in status) and min_elapsed >= MIN_MINUTES_ELAPSED:
+        if fid in LOCAL_TRACKED_MATCHES:
+            return
 
-    state = LOCAL_TRACKED_MATCHES.get(fid, {
-        'bet_placed': False,
-        'last_seen': time.time(),
-        'active': False,
-        'processed_ht': False  
-    })
-    state['last_seen'] = time.time()
+        try:
+            stats_data = SOFASCORE_CLIENT.get_stats(fid)
+            if not stats_data or not stats_data.win_probability:
+                return
 
-    if is_in_active_window(min_elapsed):
-        state['active'] = True
+            prob = stats_data.win_probability
+            home_prob = float(prob.home)
+            draw_prob = float(prob.draw)
+            away_prob = float(prob.away)
 
-    LOCAL_TRACKED_MATCHES[fid] = state
+            dominant_team = None
+            target_side = None # 'HOME' or 'AWAY'
+            highest_prob = 0.0
 
-    # =============================================
-    # 1. PLACE PARLAY BET (TRIGGER WINDOW ACTION)
-    # =============================================
-    if '1ST' in status and min_elapsed in MINUTES_REGULAR_BET and not state['bet_placed']:
-        if not firebase_manager.is_state_locked():
-            
-            if score in ['1-1', '2-2', '3-3']:
-                current_total_corners = get_live_1st_half_corners(fid)
-                target_corner_line = float(current_total_corners + 0.5)
+            if home_prob >= MIN_PROBABILITY_THRESHOLD:
+                dominant_team = match.home_team.name
+                target_side = 'HOME'
+                highest_prob = home_prob
+            elif away_prob >= MIN_PROBABILITY_THRESHOLD:
+                dominant_team = match.away_team.name
+                target_side = 'AWAY'
+                highest_prob = away_prob
 
-                stake, seq = calculate_stake()
-                data = {
+            if dominant_team:
+                logger.info(f"🔥 High Probability Match Triggered: {match_name} ({highest_prob}%)")
+                
+                payload = {
                     'match_name': match_name,
                     'league': league,
-                    'trigger_score': score,
-                    'trigger_corners': current_total_corners,
-                    'target_corner_line': target_corner_line,
-                    'stake': stake,
-                    'match_sequence': seq,
-                    'bet_type': 'parlay_score_corners'
+                    'country': country,
+                    'trigger_minute': min_elapsed,
+                    'trigger_score': score_str,
+                    'dominant_team': dominant_team,
+                    'target_side': target_side,
+                    'predicted_probability': highest_prob,
+                    'probabilities_at_trigger': {
+                        'home': home_prob,
+                        'draw': draw_prob,
+                        'away': away_prob
+                    }
                 }
-
-                firebase_manager.add_unresolved_bet(fid, data)
-
+                
+                firebase_manager.add_unresolved_probability_bet(fid, payload)
+                
                 send_telegram(
-                    f"🎯 **PARLAY BET PLACED (Match {seq})**\n⏱ {min_elapsed}' | {match_name}\n🌍 {country} | 🏆 {league}\n\n"
-                    f"🎰 **Parlay Leg 1:** Score to remain {score} at HT\n"
-                    f"📐 **Parlay Leg 2:** 1st Half Corners Over {target_corner_line} (Current: {current_total_corners})"
-                    f"\n💰 Stake: ${stake:.2f}"
+                    f"📊 **HIGH WIN PROBABILITY DETECTED**\n"
+                    f"⏱ {min_elapsed}' | {match_name}\n"
+                    f"🏆 {league} ({country})\n"
+                    f"⚽ Current Score: `{score_str}`\n\n"
+                    f"🔥 **Target Team:** {dominant_team}\n"
+                    f"📈 **Win Probability:** `{highest_prob:.1f}%` \n\n"
+                    f"📋 *Full Distribution:*\n"
+                    f"🏠 Home: {home_prob:.1f}% | 🤝 Draw: {draw_prob:.1f}% | 🚌 Away: {away_prob:.1f}%"
                 )
+                
+                LOCAL_TRACKED_MATCHES[fid] = True
 
-        state['bet_placed'] = True
+        except Exception as e:
+            logger.error(f"Error analyzing live probabilities for match {fid}: {e}")
 
-    # =============================================
-    # 2. HALFTIME CHECK & PARLAY EVALUATION
-    # =============================================
-    elif 'HALFTIME' in status and not state['processed_ht']:
-        unresolved = firebase_manager.get_unresolved_bet(fid)
-
+    # ----------------------------------------------------
+    # PHASE 2: EVALUATING POST-MATCH COMPLETED RESOLUTIONS
+    # ----------------------------------------------------
+    elif 'ENDED' in status or 'FT' in status or 'FINISHED' in status:
+        unresolved = firebase_manager.get_unresolved_probability_bet(fid)
+        
         if unresolved:
-            final_ht_corners = get_live_1st_half_corners(fid)
-
-            score_leg_win = (score == unresolved['trigger_score'])
-            corner_leg_win = (float(final_ht_corners) > unresolved['target_corner_line'])
-
-            parlay_win = score_leg_win and corner_leg_win
-            outcome = 'win' if parlay_win else 'loss'
+            logger.info(f"🏁 Match Finished. Processing settlement data for: {match_name}")
             
-            stake = unresolved.get('stake', 0.0)
-            pnl = -stake if outcome == 'loss' else 0.0 
-
+            target_side = unresolved.get('target_side')
+            outcome = 'loss'
+            
+            # Settlement Calculations
+            if target_side == 'HOME' and home_score > away_score:
+                outcome = 'win'
+            elif target_side == 'AWAY' and away_score > home_score:
+                outcome = 'win'
+                
             unresolved.update({
-                'final_ht_score': score,
-                'final_ht_corners': final_ht_corners,
-                'score_leg_result': 'WIN' if score_leg_win else 'LOSS',
-                'corner_leg_result': 'WIN' if corner_leg_win else 'LOSS',
-                'pnl': round(pnl, 2)
+                'final_score': score_str,
+                'home_final_score': home_score,
+                'away_final_score': away_score
             })
-
-            firebase_manager.move_to_resolved(fid, unresolved, outcome)
-
-            status_emoji = '✅' if parlay_win else '❌'
+            
+            firebase_manager.move_to_resolved_probability_bet(fid, unresolved, outcome)
+            
+            status_emoji = '✅' if outcome == 'win' else '❌'
             send_telegram(
-                f"{status_emoji} **PARLAY RESULT: {outcome.upper()}**\n{match_name}\n\n"
-                f"🎰 Score Leg: {unresolved['trigger_score']} -> HT Score: {score} ({unresolved['score_leg_result']})\n"
-                f"📐 Corner Leg: Target Over {unresolved['target_corner_line']} -> HT Corners: {final_ht_corners} ({unresolved['corner_leg_result']})\n\n"
-                f"📊 Session PnL: ${unresolved['pnl']:.2f}"
+                f"{status_emoji} **PROBABILITY RESULT: {outcome.upper()}**\n"
+                f"{match_name}\n"
+                f"🏆 {unresolved.get('league')}\n\n"
+                f"🎯 **Picked Team:** {unresolved.get('dominant_team')} (>{unresolved.get('predicted_probability')}% Win Prob)\n"
+                f"🏁 **Final Score:** {score_str}\n"
+                f"📝 **Outcome:** {'Target team won the match' if outcome == 'win' else 'Target team failed to win'}"
             )
             
-            state['processed_ht'] = True
-            LOCAL_TRACKED_MATCHES[fid] = state
+            # Safely clear local tracking memory cache 
             LOCAL_TRACKED_MATCHES.pop(fid, None)
 
 # =========================
-# INIT / MAIN
+# INITIALIZATION & EXECUTION
 # =========================
 def initialize_bot_services():
     global firebase_manager, SOFASCORE_CLIENT
@@ -263,9 +225,10 @@ def initialize_bot_services():
     try:
         SOFASCORE_CLIENT = SofascoreClient()
         SOFASCORE_CLIENT.initialize()
-        logger.info("✅ Sofascore initialized")
+        logger.info("✅ Win Probability Settlement Bot successfully initialized.")
         return True
-    except:
+    except Exception as e:
+        logger.error(f"Failed to initialize service components: {e}")
         return False
 
 def shutdown_bot():
@@ -274,11 +237,24 @@ def shutdown_bot():
         except: pass
 
 def run_bot_cycle():
-    if not SOFASCORE_CLIENT: return
+    if not SOFASCORE_CLIENT: 
+        return
     try:
         events = SOFASCORE_CLIENT.get_events(live=True)
-        if not events: return
+        if not events: 
+            return
         for m in events:
             process_match(m)
     except Exception as e:
-        logger.error(f"Error in execution loop: {e}")
+        logger.error(f"Error inside live collection cycle loop: {e}")
+
+if __name__ == "__main__":
+    if initialize_bot_services():
+        logger.info("🚀 Bot monitoring engine active...")
+        try:
+            while True:
+                run_bot_cycle()
+                time.sleep(SLEEP_TIME)
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Shutting down bot session gracefully...")
+            shutdown_bot()
