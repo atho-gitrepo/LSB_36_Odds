@@ -12,7 +12,7 @@ from esd.sofascore import SofascoreClient
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(name)s | [%(levelname)s] | %(message)s',
-    handlers=[logging.FileHandler("win_prob_prematch.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("win_prob_prematch_trace.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger("WinProbPreMatchBot")
 
@@ -23,7 +23,7 @@ FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
 
 # --- CONFIGURATION SETTINGS ---
 MIN_PROBABILITY_THRESHOLD = 70.0  
-CHECK_INTERVAL_HOURS = 6 # How often to scan for the day's upcoming matches
+CHECK_INTERVAL_HOURS = 6 # Frequency multiplier interval for standard runs
 
 # --- LEAGUE FILTERS ---
 ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League', 'Copa Colombia']
@@ -37,40 +37,51 @@ class FirebaseManager:
     def __init__(self, creds_json):
         self.db = None
         if not creds_json:
-            logger.error("[FIREBASE_INIT] ❌ Firebase Credentials missing!")
+            logger.error("[FIREBASE_INIT] ❌ Firebase Credentials missing in environment variables!")
             return
         try:
+            logger.info("[FIREBASE_INIT] Attempting to parse credentials JSON string...")
             cred_dict = json.loads(creds_json)
             cred = credentials.Certificate(cred_dict)
             if not firebase_admin._apps:
                 firebase_admin.initialize_app(cred)
+                logger.info("[FIREBASE_INIT] Firebase SDK App initialized successfully.")
             self.db = firestore.client()
             logger.info("✅ [FIREBASE_INIT] Firestore client successfully connected.")
         except Exception as e:
-            logger.error(f"❌ [FIREBASE_INIT] Firebase initialization failure: {e}", exc_info=True)
+            logger.error(f"❌ [FIREBASE_INIT] Critical Firebase initialization failure: {e}", exc_info=True)
 
     def add_prematch_prediction(self, match_id, data):
-        """Saves high probability pre-match selections."""
+        """Saves high probability pre-match selections into Firestore."""
         try:
-            if not self.db: return
+            if not self.db:
+                logger.warning(f"[DB_WRITE] ⚠️ Database connection not ready. Skipping logging for {match_id}")
+                return
             data['logged_at'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
             data['status'] = 'PENDING_KICKOFF'
+            logger.info(f"[DB_WRITE] Writing pre-match favorite details for match {match_id}...")
             self.db.collection('prematch_prob_bets').document(str(match_id)).set(data)
-            logger.info(f"[DB_WRITE] ✅ Logged pre-match favorite for ID: {match_id}")
+            logger.info(f"[DB_WRITE] ✅ Successfully wrote match {match_id} to prematch_prob_bets collection.")
         except Exception as e:
-            logger.error(f"[DB_WRITE] ❌ Error writing pre-match doc: {e}", exc_info=True)
+            logger.error(f"[DB_WRITE] ❌ Error writing pre-match configuration document: {e}", exc_info=True)
 
     def is_match_already_logged(self, match_id):
-        """Prevents logging/sending the same pre-match game multiple times."""
-        if not self.db: return False
-        doc = self.db.collection('prematch_prob_bets').document(str(match_id)).get()
-        return doc.exists
+        """Prevents processing or notifying the same pre-match game multiple times."""
+        try:
+            if not self.db: return False
+            logger.debug(f"[DB_READ] Checking duplication for match ID: {match_id}")
+            doc = self.db.collection('prematch_prob_bets').document(str(match_id)).get()
+            return doc.exists
+        except Exception as e:
+            logger.error(f"[DB_READ] ❌ Error fetching duplication check values for ID {match_id}: {e}", exc_info=True)
+            return False
 
 # =========================
 # TELEGRAM NOTIFIER
 # =========================
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    logger.info("[TELEGRAM_API] Dispatching outgoing alert payload message packet...")
     try:
         response = requests.post(
             url,
@@ -78,11 +89,11 @@ def send_telegram(msg):
             timeout=15
         )
         if response.status_code == 200:
-            logger.info("[TELEGRAM_API] ✅ Pre-match notification delivered.")
+            logger.info("[TELEGRAM_API] ✅ Selection notification delivered successfully.")
         else:
-            logger.error(f"[TELEGRAM_API] ❌ Selection rejected: {response.text}")
+            logger.error(f"[TELEGRAM_API] ❌ Selection rejected by API endpoint: {response.text}")
     except Exception as e:
-        logger.error(f"[TELEGRAM_API] ❌ Network error: {e}", exc_info=True)
+        logger.error(f"[TELEGRAM_API] ❌ Network level transport exception encountered: {e}", exc_info=True)
 
 # ==========================================
 # PRE-MATCH ANALYSIS CORE
@@ -91,14 +102,18 @@ def process_prematch_game(match):
     fid = str(match.id)
     
     # 1. Skip if it's already live or finished
-    status_desc = match.status.description.upper() if match.status else "UNKNOWN"
-    if status_desc not in ['NOT STARTED', 'SCHEDULED']:
-        logger.debug(f"[SKIP] Match {fid} skipped because it has already started/ended (Status: {status_desc})")
+    try:
+        status_desc = match.status.description.upper() if match.status else "UNKNOWN"
+        if status_desc not in ['NOT STARTED', 'SCHEDULED']:
+            logger.debug(f"[SKIP] Match {fid} skipped because it has already kicked off (Status: {status_desc})")
+            return
+    except Exception as e:
+        logger.error(f"[MATCH_LIVE_ATTR] ❌ Error processing status checks for ID {fid}: {e}")
         return
 
     # 2. Check Database Duplication Guardrail
     if firebase_manager.is_match_already_logged(fid):
-        logger.debug(f"[SKIP] Match {fid} already parsed and logged previously.")
+        logger.debug(f"[SKIP] Match {fid} already parsed and stored previously. Skipping lookup.")
         return
 
     # 3. Parse Metadata safely
@@ -109,27 +124,34 @@ def process_prematch_game(match):
         kickoff_ts = match.start_timestamp if hasattr(match, 'start_timestamp') else None
         kickoff_time = datetime.utcfromtimestamp(kickoff_ts).strftime('%Y-%m-%d %H:%M UTC') if kickoff_ts else "Unknown"
     except Exception as e:
-        logger.error(f"[PARSE_ERROR] Failed parsing basic fields on match {fid}: {e}")
+        logger.error(f"[PARSE_ERROR] Failed parsing basic structural attributes on match {fid}: {e}")
         return
 
     # 4. Filter Leagues
     full_info = f"{league} {country}".lower()
     if not any(x.lower() in league.lower() for x in ALLOWED_LEAGUES):
         if any(x.lower() in full_info for x in EXCLUDED_LEAGUES + AMATEUR_KEYWORDS):
+            logger.debug(f"[FILTER] Match {match_name} ({fid}) bypassed by tracking exclusion filters.")
             return
 
     # 5. Fetch Pre-Match Probabilities
-    logger.info(f"[PREMATCH_CHECK] Fetching pre-match outlook for: {match_name} ({fid})...")
+    logger.info(f"[PREMATCH_CHECK] Evaluating pre-match matrix for: {match_name} ({fid})...")
     try:
         stats_data = SOFASCORE_CLIENT.get_stats(int(fid))
-        if not stats_data or not hasattr(stats_data, 'win_probability') or stats_data.win_probability is None:
-            logger.warning(f"[PREMATCH_CHECK] Win probabilities unavailable for pre-match game: {fid}")
+        if not stats_data:
+            logger.warning(f"[PREMATCH_CHECK] Client returned empty stats container wrapper object for {match_name} ({fid})")
+            return
+            
+        if not hasattr(stats_data, 'win_probability') or stats_data.win_probability is None:
+            logger.warning(f"[PREMATCH_CHECK] Win probability metrics unavailable for pre-match game ID: {fid}")
             return
 
         prob = stats_data.win_probability
         home_prob = float(prob.home) if prob.home is not None else 0.0
         draw_prob = float(prob.draw) if prob.draw is not None else 0.0
         away_prob = float(prob.away) if prob.away is not None else 0.0
+
+        logger.info(f"[PREMATCH_CHECK] Values loaded for {match_name} -> Home: {home_prob}%, Draw: {draw_prob}%, Away: {away_prob}%")
 
         dominant_team = None
         target_side = None
@@ -146,7 +168,7 @@ def process_prematch_game(match):
 
         # 6. Trigger if high-confidence pre-match selection is found
         if dominant_team:
-            logger.info(f"🔥 [PRE-MATCH TRIGGER] {dominant_team} discovered with {highest_prob}% pre-match expectation.")
+            logger.info(f"🔥 [PRE-MATCH TRIGGER] High confidence threshold passed! {dominant_team} has {highest_prob}% pre-match expectation.")
             
             payload = {
                 'match_name': match_name,
@@ -177,45 +199,57 @@ def process_prematch_game(match):
             )
 
     except Exception as e:
-        logger.error(f"[PREMATCH_CHECK] ❌ Error requesting analytics engine for ID {fid}: {e}", exc_info=True)
+        logger.error(f"[PREMATCH_CHECK] ❌ Exception occurred parsing deep client statistics engine for ID {fid}: {e}", exc_info=True)
 
-# =========================
-# RUNTIME ENVIRONMENT CONTROLS
-# =========================
+# ========================================
+# RUNTIME ENVIRONMENT CYCLE CONTROLLER
+# ========================================
 def run_prematch_scan_cycle():
-    if not SOFASCORE_CLIENT: return
+    if not SOFASCORE_CLIENT: 
+        logger.error("[CYCLE_EXEC] ❌ Aborting routine loop cycle: Client object reference is set to None.")
+        return
     try:
-        logger.info("[SCAN_CYCLE] Fetching today's full scheduled football fixtures...")
-        # live=False pulls the pre-match daily schedule dictionary layout
+        logger.info("[CYCLE_EXEC] Querying network layer for today's scheduled football fixtures...")
         events = SOFASCORE_CLIENT.get_events(date="today", live=False)
         if not events:
-            logger.info("[SCAN_CYCLE] No scheduled fixtures returned for today.")
+            logger.info("[CYCLE_EXEC] No scheduled fixtures returned for today.")
             return
             
-        logger.info(f"[SCAN_CYCLE] Scanning through {len(events)} pre-match fixtures against constraints...")
+        logger.info(f"[CYCLE_EXEC] Scanning through {len(events)} pre-match fixtures against constraints...")
         for match in events:
             process_prematch_game(match)
-            # Short sleep to space out requests and mitigate Cloudflare rate limits/blocks
-            time.sleep(1.0)
+            # Short anti-scraping throttling step sequence
+            time.sleep(1.2)
             
     except Exception as e:
-        logger.error(f"[SCAN_CYCLE] ❌ Error during execution: {e}", exc_info=True)
-# Backward compatibility alias for main.py execution linkage
+        logger.error(f"[CYCLE_EXEC] ❌ Error caught inside the active loop execution processing thread: {e}", exc_info=True)
+
+# ======================================================================
+# 🔄 BACKWARD COMPATIBILITY ALIASES FOR MAIN.PY ORCHESTRATION LAYER
+# ======================================================================
+SLEEP_TIME = CHECK_INTERVAL_HOURS * 3600
 run_bot_cycle = run_prematch_scan_cycle
 
+# =========================
+# SYSTEM ENTRY MAIN TRAP
+# =========================
 if __name__ == "__main__":
-    logger.info("🎬 Launching Pre-Match Win Probability Bot...")
+    logger.info("🎬 Launching Pre-Match Win Probability Bot Application...")
     firebase_manager = FirebaseManager(FIREBASE_CREDENTIALS)
     
     try:
+        logger.info("[INIT] Spinning up browser engine configuration layers...")
         SOFASCORE_CLIENT = SofascoreClient()
         SOFASCORE_CLIENT.initialize()
+        logger.info("🚀 Monitoring loops initialized successfully. System running pre-match scans.")
         
         while True:
             run_prematch_scan_cycle()
-            logger.info(f"[SLEEP] Cycle complete. Next full pre-match scan in {CHECK_INTERVAL_HOURS} hours.")
-            time.sleep(CHECK_INTERVAL_HOURS * 3600)
+            logger.info(f"[SLEEP] Cycle execution complete. Next full pre-match scan in {CHECK_INTERVAL_HOURS} hours.")
+            time.sleep(SLEEP_TIME)
             
     except (KeyboardInterrupt, SystemExit):
-        logger.info("[EXIT] Shutting down gracefully.")
-        if SOFASCORE_CLIENT: SOFASCORE_CLIENT.close()
+        logger.info("[APP_INTERRUPT] Exit signal registered by system environment.")
+        if SOFASCORE_CLIENT: 
+            SOFASCORE_CLIENT.close()
+            logger.info("[SHUTDOWN] Browser resources decoupled cleanly.")
