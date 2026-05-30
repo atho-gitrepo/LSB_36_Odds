@@ -20,19 +20,16 @@ logger = logging.getLogger("BetBot")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "YOUR_API_KEY_HERE")
 
 # --- SETTINGS ---
 ORIGINAL_STAKE = 10.0
 MAX_CHASE_LEVEL = 4
 SLEEP_TIME = 95
 MINUTES_REGULAR_BET = [35, 36, 37]
-BOOKMAKERS_TO_CHECK = ['Bet365', '1xBet']
 
 # --- FILTERS ---
 ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League', 'Copa Colombia']
 EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'Friendly']
-# 'u1' dynamically targets youth categories from U13 up to U18
 AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u1', 'u23', 'u21', 'u20', 'women', 'college']
 
 # --- SMART OPTIMIZATION SETTINGS ---
@@ -129,57 +126,7 @@ def is_in_active_window(minute):
     return PRE_WARM_WINDOW[0] <= minute <= PRE_WARM_WINDOW[1]
 
 # =========================
-# DYNAMIC FIRST HALF JIT ODDS CALCULATOR
-# =========================
-def fetch_odds_triggered(home_team, away_team, current_score):
-    """
-    Robust JIT fetching targeting 1st Half Goals Over/Under markets dynamically.
-    Includes token-based team matching algorithms and wider time parsing bounds.
-    """
-    since = int(time.time()) - 300
-    results = {'Bet365': 0.0, '1xBet': 0.0}
-    
-    try:
-        home_g, away_g = map(int, current_score.split('-'))
-        total_current_goals = home_g + away_g
-        target_threshold = float(total_current_goals + 0.5) 
-    except Exception as e:
-        logger.error(f"Failed parsing score line mapping to 1st half totals target: {e}")
-        return results
-
-    h_tokens = [t.strip().lower() for t in home_team.split(' ') if len(t.strip()) > 3]
-    a_tokens = [t.strip().lower() for t in away_team.split(' ') if len(t.strip()) > 3]
-
-    for bkr in BOOKMAKERS_TO_CHECK:
-        url = f"https://api.odds-api.io/v3/odds/updated?apiKey={ODDS_API_KEY}&since={since}&bookmaker={bkr}&sport=Football&market=1st_half_totals"
-        try:
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                for match_odds in data.get('odds', []):
-                    o_home = match_odds['home'].lower()
-                    o_away = match_odds['away'].lower()
-                    
-                    matched = (home_team.lower() in o_home or any(tk in o_home for tk in h_tokens)) and \
-                              (away_team.lower() in o_away or any(tk in o_away for tk in a_tokens))
-                              
-                    if matched:
-                        under_odds = next(
-                            (o['odds'] for o in match_odds.get('outcomes', []) 
-                             if o['name'].lower() == 'under' and float(o.get('handicap', o.get('param', 0))) == target_threshold), 
-                            0.0
-                        )
-                        results[bkr] = float(under_odds)
-                        break 
-            else:
-                logger.error(f"Odds API responded with error status code: {resp.status_code}")
-        except Exception as e:
-            logger.error(f"REST API 1st Half Totals fetch error for {bkr}: {e}")
-            
-    return results
-
-# =========================
-# MATCH PROCESS
+# MATCH PROCESS (PARLAY UPDATE)
 # =========================
 def process_match(match):
     fid = str(match.id)
@@ -213,89 +160,92 @@ def process_match(match):
     LOCAL_TRACKED_MATCHES[fid] = state
 
     # =========================
-    # 1. PLACE BET (TRIGGER DRIVEN)
+    # 1. PLACE PARLAY BET (TRIGGER DRIVEN)
     # =========================
     if '1ST' in status and min_elapsed in MINUTES_REGULAR_BET and not state['bet_placed']:
         if not firebase_manager.is_state_locked():
             
             if score in ['1-1', '2-2', '3-3']:
-                home_goals = int(score.split('-')[0])
-                market_label = f"1st Half Under {int(home_goals * 2) + 0.5}" 
-                
-                logger.info(f"🎯 Strategy Triggered for {match_name} ({score}). Pulling {market_label} lines...")
-                odds_data = fetch_odds_triggered(match.home_team.name, match.away_team.name, score)
-                
-                odds_b365 = odds_data.get('Bet365', 0.0)
-                odds_1x = odds_data.get('1xBet', 0.0)
-
-                # ====================================================
-                # ✅ INTERCEPT POSITION: SKIP ACTION IF FEED GIVES 0.0
-                # ====================================================
-                if odds_b365 == 0.0 and odds_1x == 0.0:
-                    logger.warning(f"⚠️ Skipping match {match_name} due to unpriced lines (0.0).")
+                # Extract real-time live corner data safely from the match object properties
+                try:
+                    home_corners = int(getattr(match.home_stats, 'corners', 0))
+                    away_corners = int(getattr(match.away_stats, 'corners', 0))
+                except Exception:
+                    # Fallback default if nested stats objects are unmapped in payload structure
+                    home_corners = 0
+                    away_corners = 0
                     
-                    send_telegram(
-                        f"⚠️ **MATCH SKIPPED (Odds Unavailable)**\n⏱ {min_elapsed}' | {match_name}\n"
-                        f"🏆 {league}\n🔢 Score: {score}\n📢 *Skipped this match cycle because {market_label} is unlisted or suspended.*"
-                    )
-                    
-                    state['bet_placed'] = True
-                    LOCAL_TRACKED_MATCHES[fid] = state
-                    LOCAL_TRACKED_MATCHES.pop(fid, None)
-                    return
-                # ====================================================
+                current_total_corners = home_corners + away_corners
+                target_corner_line = float(current_total_corners + 0.5)
 
-                # Continues safely only if valid liquid odds are available
                 stake, seq = calculate_stake()
                 data = {
                     'match_name': match_name,
                     'league': league,
-                    '36_score': score,
+                    'trigger_score': score,
+                    'trigger_corners': current_total_corners,
+                    'target_corner_line': target_corner_line,
                     'stake': stake,
                     'match_sequence': seq,
-                    'bet_type': 'regular',
-                    'odds_bet365': odds_b365,
-                    'odds_1xbet': odds_1x
+                    'bet_type': 'parlay_score_corners'
                 }
 
                 firebase_manager.add_unresolved_bet(fid, data)
 
                 send_telegram(
-                    f"🎯 **BET PLACED (Match {seq})**\n⏱ {min_elapsed}' | {match_name}\n🌍 {country} | 🏆 {league}\n🔢 Score: {score}\n💰 Stake: ${stake:.2f}\n"
-                    f"📈 {market_label} Market -> Bet365: {data['odds_bet365']} | 1xBet: {data['odds_1xbet']}"
+                    f"🎯 **PARLAY BET PLACED (Match {seq})**\n⏱ {min_elapsed}' | {match_name}\n🌍 {country} | 🏆 {league}\n\n"
+                    f"🎰 **Parlay Leg 1:** Score to remain {score} at HT\n"
+                    f"📐 **Parlay Leg 2:** 1st Half Corners Over {target_corner_line} (Current: {current_total_corners})"
+                    f"\n💰 Stake: ${stake:.2f}"
                 )
 
         state['bet_placed'] = True
 
     # =========================
-    # 2. HT CHECK
+    # 2. HT CHECK & SETTLEMENT
     # =========================
     elif 'HALFTIME' in status and not state['processed_ht']:
         unresolved = firebase_manager.get_unresolved_bet(fid)
 
         if unresolved:
-            outcome = 'win' if score == unresolved['36_score'] else 'loss'
+            # Extract final HT stats to evaluate the corner leg
+            try:
+                ht_home_corners = int(getattr(match.home_stats, 'corners', 0))
+                ht_away_corners = int(getattr(match.away_stats, 'corners', 0))
+                final_ht_corners = ht_home_corners + ht_away_corners
+            except Exception:
+                final_ht_corners = unresolved.get('trigger_corners', 0)
+
+            # Leg 1 Evaluation: Did score stay the same as our snapshot record?
+            score_leg_win = (score == unresolved['trigger_score'])
             
-            execution_odds = max(unresolved.get('odds_bet365', 0.0), unresolved.get('odds_1xbet', 0.0))
+            # Leg 2 Evaluation: Did final corners clear our target baseline threshold?
+            corner_leg_win = (float(final_ht_corners) > unresolved['target_corner_line'])
+
+            # Parlay wins ONLY if both conditions are met
+            parlay_win = score_leg_win and corner_leg_win
+            outcome = 'win' if parlay_win else 'loss'
+            
             stake = unresolved.get('stake', 0.0)
-            
-            if outcome == 'win':
-                pnl = (stake * execution_odds) - stake if execution_odds > 0 else 0.0
-            else:
-                pnl = -stake
-                
+            pnl = -stake if outcome == 'loss' else 0.0 # Note: Set static profit rule or dynamic tracking if tracking custom exchange Slips
+
             unresolved.update({
                 'final_ht_score': score,
-                'pnl': round(pnl, 2),
-                'bet_odds_used': execution_odds,
-                'roi_percentage': round((pnl / stake) * 100, 2) if stake > 0 else 0.0
+                'final_ht_corners': final_ht_corners,
+                'score_leg_result': 'WIN' if score_leg_win else 'LOSS',
+                'corner_leg_result': 'WIN' if corner_leg_win else 'LOSS',
+                'pnl': round(pnl, 2)
             })
 
             firebase_manager.move_to_resolved(fid, unresolved, outcome)
 
+            # Build readable verification summary telegram update
+            status_emoji = '✅' if parlay_win else '❌'
             send_telegram(
-                f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} HT\n{match_name}\n"
-                f"Score: {score}\n📊 PnL: ${unresolved['pnl']:.2f} ({unresolved['roi_percentage']}% ROI)"
+                f"{status_emoji} **PARLAY RESULT: {outcome.upper()}**\n{match_name}\n\n"
+                f"🎰 Score Leg: {unresolved['trigger_score']} -> Final HT Score: {score} ({unresolved['score_leg_result']})\n"
+                f"📐 Corner Leg: Target Over {unresolved['target_corner_line']} -> Final HT Corners: {final_ht_corners} ({unresolved['corner_leg_result']})\n\n"
+                f"📊 Session PnL: ${unresolved['pnl']:.2f}"
             )
             
             state['processed_ht'] = True
