@@ -3,6 +3,7 @@ import os
 import json
 import time
 import logging
+import random
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -27,12 +28,76 @@ CHECK_INTERVAL_HOURS = 6
 
 # --- LEAGUE FILTERS ---
 ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League', 'Copa Colombia']
-EXCLUDED_LEAGUES = ['England Amateur']
-AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'u1', 'u23', 'u21', 'u20', 'women', 'college']
+EXCLUDED_LEAGUES = ['USA', 'Poland', 'Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'Friendly']
+AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u1', 'u23', 'u21', 'u20', 'women', 'college']
 
-# Global instances for compatibility tracking
+# Global instances
 firebase_manager = None
 SOFASCORE_CLIENT = None
+
+# ======================================================================
+# 🛡️ STEALTH CLIENT INJECTION (Bypasses Cloudflare & Empty Stats 0.0%)
+# ======================================================================
+class PatchedSofascoreClient(SofascoreClient):
+    """
+    Overrides the baseline client to inject anti-fingerprinting parameters
+    and enforce a human-like UI anchoring sequence before reading raw JSON APIs.
+    """
+    def initialize(self):
+        # Call the original library init to spin up Playwright
+        super().initialize()
+        try:
+            from playwright_stealth import stealth_sync
+            # Inject stealth modifications directly into the active page object
+            if hasattr(self, 'service') and hasattr(self.service, 'page'):
+                stealth_sync(self.service.page)
+                logger.info("🛡️ [STEALTH_PATCH] Playwright Stealth applied directly to browser context.")
+        except ImportError:
+            logger.warning("⚠️ [STEALTH_PATCH] 'playwright-stealth' package missing. Running fallback parameters.")
+            if hasattr(self, 'service') and hasattr(self.service, 'page'):
+                self.service.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+    def get_stats(self, event_id):
+        """Overrides the stats grabber to hit the human UI page first as an anchor."""
+        try:
+            if hasattr(self, 'service') and hasattr(self.service, 'page'):
+                page = self.service.page
+                
+                # Step 1: Navigate to the human event details page to establish valid session cookies
+                human_url = f"https://www.sofascore.com/event/{event_id}"
+                logger.info(f"🕵️‍♂️ [STEALTH_NAV] Anchoring session context at UI layer: {human_url}")
+                
+                page.goto(human_url, timeout=30000, wait_until="domcontentloaded")
+                time.sleep(random.uniform(2.0, 4.5)) # Mimic natural human pacing delay
+                
+                # Step 2: Now target the raw internal win-probability API endpoint
+                api_url = f"https://www.sofascore.com/api/v1/event/{event_id}/win-probability"
+                logger.info(f"🕵️‍♂️ [STEALTH_NAV] Executing payload extraction request: {api_url}")
+                
+                page.goto(api_url, timeout=15000, wait_until="networkidle")
+                raw_content = page.locator("body").inner_text().strip()
+                
+                # Convert raw browser string back into structure
+                data_dict = json.loads(raw_content)
+                
+                # Return standard object expectations back to our processing loops
+                class Struct:
+                    def __init__(self, **entries): self.__dict__.update(entries)
+                
+                if 'winProbability' in data_dict:
+                    wp = data_dict['winProbability']
+                    prob_obj = Struct(
+                        home=wp.get('home'),
+                        draw=wp.get('draw'),
+                        away=wp.get('away')
+                    )
+                    return Struct(win_probability=prob_obj)
+            
+            # Fallback to standard library function if internal mapping references change
+            return super().get_stats(event_id)
+        except Exception as e:
+            logger.error(f"❌ [STEALTH_NAV] Intercept error on match {event_id}: {e}")
+            return None
 
 # =========================
 # FIREBASE STORAGE
@@ -157,6 +222,10 @@ def process_prematch_game(match):
 
         logger.info(f"[PREMATCH_CHECK] Values loaded for {match_name} -> Home: {home_prob}%, Draw: {draw_prob}%, Away: {away_prob}%")
 
+        if home_prob == 0.0 and draw_prob == 0.0 and away_prob == 0.0:
+            logger.warning(f"[PREMATCH_CHECK] ⚠️ Match data read yielded pure zeros for {match_name}. WAF block might still be active.")
+            return
+
         dominant_team = None
         target_side = None
         highest_prob = 0.0
@@ -222,7 +291,8 @@ def run_prematch_scan_cycle():
         logger.info(f"[CYCLE_EXEC] Scanning through {len(events)} pre-match fixtures against constraints...")
         for match in events:
             process_prematch_game(match)
-            time.sleep(1.2)
+            # Modest delay to reduce footprint profiling signatures
+            time.sleep(random.uniform(1.5, 3.0))
             
     except Exception as e:
         logger.error(f"[CYCLE_EXEC] ❌ Error caught inside the active loop execution processing thread: {e}", exc_info=True)
@@ -231,10 +301,7 @@ def run_prematch_scan_cycle():
 # 🏁 AUTOMATED POST-MATCH SETTLEMENT ENGINE
 # ======================================================================
 def check_and_settle_completed_matches(sofascore_client, f_manager):
-    """
-    Scans Firestore for pending pre-match picks, checks if they have finished,
-    and updates their status to WIN or LOSS based on the final score outcome.
-    """
+    """Scans Firestore for pending pre-match picks and marks them as WIN or LOSS."""
     if not f_manager or not f_manager.db:
         logger.warning("[SETTLEMENT] Firestore client instance not connected. Skipping cycle verification.")
         return
@@ -272,7 +339,6 @@ def check_and_settle_completed_matches(sofascore_client, f_manager):
                 away_score = event_update.away_score.current if event_update.away_score and event_update.away_score.current is not None else 0
                 score_str = f"{home_score}-{away_score}"
                 
-                # Settle outcome criteria
                 outcome = 'LOSS'
                 if target_side == 'HOME' and home_score > away_score:
                     outcome = 'WIN'
@@ -290,12 +356,10 @@ def check_and_settle_completed_matches(sofascore_client, f_manager):
                     'resolution_timestamp': firestore.SERVER_TIMESTAMP
                 })
 
-                # Atomically move to resolved logs collection
                 f_manager.db.collection('resolved_prob_bets').document(str(match_id)).set(match_data)
                 f_manager.db.collection('prematch_prob_bets').document(str(match_id)).delete()
                 logger.info(f"[SETTLEMENT] ✅ Record {match_id} safely archived into resolved data pool history.")
 
-                # Teleport notification to channel
                 status_emoji = '✅' if outcome == 'WIN' else '❌'
                 send_telegram(
                     f"{status_emoji} **PRE-MATCH SELECTION SETTLED: {outcome}**\n"
@@ -324,8 +388,9 @@ def initialize_bot_services():
     logger.info("[INIT] Executing main.py orchestrated initialization sequence...")
     firebase_manager = FirebaseManager(FIREBASE_CREDENTIALS)
     try:
-        logger.info("[INIT] Bootstrapping automated web monitoring browsers...")
-        SOFASCORE_CLIENT = SofascoreClient()
+        logger.info("[INIT] Bootstrapping automated web monitoring browsers with custom Patched Engine...")
+        # Instantiating the patched local class instead of base library variant
+        SOFASCORE_CLIENT = PatchedSofascoreClient()
         SOFASCORE_CLIENT.initialize()
         logger.info("✅ [INIT] Global service structures are ready and armed.")
         return True
