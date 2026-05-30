@@ -31,8 +31,9 @@ BOOKMAKERS_TO_CHECK = ['Bet365', '1xBet']
 
 # --- FILTERS ---
 ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League', 'Copa Colombia']
-EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'U19', 'U21', 'Friendly']
-AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u23', 'u21','u20', 'women', 'college']
+EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'Friendly']
+# 'u1' dynamically targets youth categories from U13 up to U18
+AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u1', 'u23', 'u21', 'u20', 'women', 'college']
 
 # --- SMART OPTIMIZATION SETTINGS ---
 PREDICT_START_MIN = 30     
@@ -128,14 +129,13 @@ def is_in_active_window(minute):
     return PRE_WARM_WINDOW[0] <= minute <= PRE_WARM_WINDOW[1]
 
 # =========================
-# DYNAMIC FIRST HALF JIT ODDS CALCULATOR (FIXED)
+# DYNAMIC FIRST HALF JIT ODDS CALCULATOR
 # =========================
 def fetch_odds_triggered(home_team, away_team, current_score):
     """
     Robust JIT fetching targeting 1st Half Goals Over/Under markets dynamically.
     Includes token-based team matching algorithms and wider time parsing bounds.
     """
-    # FIX: Expanded looking window from 60 to 300 seconds to prevent empty returns due to container time drift
     since = int(time.time()) - 300
     results = {'Bet365': 0.0, '1xBet': 0.0}
     
@@ -147,7 +147,6 @@ def fetch_odds_triggered(home_team, away_team, current_score):
         logger.error(f"Failed parsing score line mapping to 1st half totals target: {e}")
         return results
 
-    # Optimize tokenization arrays for fallback cross-matching variations
     h_tokens = [t.strip().lower() for t in home_team.split(' ') if len(t.strip()) > 3]
     a_tokens = [t.strip().lower() for t in away_team.split(' ') if len(t.strip()) > 3]
 
@@ -161,7 +160,6 @@ def fetch_odds_triggered(home_team, away_team, current_score):
                     o_home = match_odds['home'].lower()
                     o_away = match_odds['away'].lower()
                     
-                    # FIX: Token-containment validation logic to resolve alternative naming naming conventions
                     matched = (home_team.lower() in o_home or any(tk in o_home for tk in h_tokens)) and \
                               (away_team.lower() in o_away or any(tk in o_away for tk in a_tokens))
                               
@@ -172,7 +170,9 @@ def fetch_odds_triggered(home_team, away_team, current_score):
                             0.0
                         )
                         results[bkr] = float(under_odds)
-                        break # break the match inner search loop once verified
+                        break 
+            else:
+                logger.error(f"Odds API responded with error status code: {resp.status_code}")
         except Exception as e:
             logger.error(f"REST API 1st Half Totals fetch error for {bkr}: {e}")
             
@@ -203,7 +203,7 @@ def process_match(match):
         'bet_placed': False,
         'last_seen': time.time(),
         'active': False,
-        'processed_ht': False  # FIX: Escape track to handle multi-cycle lockups at half-time
+        'processed_ht': False  
     })
     state['last_seen'] = time.time()
 
@@ -225,6 +225,27 @@ def process_match(match):
                 logger.info(f"🎯 Strategy Triggered for {match_name} ({score}). Pulling {market_label} lines...")
                 odds_data = fetch_odds_triggered(match.home_team.name, match.away_team.name, score)
                 
+                odds_b365 = odds_data.get('Bet365', 0.0)
+                odds_1x = odds_data.get('1xBet', 0.0)
+
+                # ====================================================
+                # ✅ INTERCEPT POSITION: SKIP ACTION IF FEED GIVES 0.0
+                # ====================================================
+                if odds_b365 == 0.0 and odds_1x == 0.0:
+                    logger.warning(f"⚠️ Skipping match {match_name} due to unpriced lines (0.0).")
+                    
+                    send_telegram(
+                        f"⚠️ **MATCH SKIPPED (Odds Unavailable)**\n⏱ {min_elapsed}' | {match_name}\n"
+                        f"🏆 {league}\n🔢 Score: {score}\n📢 *Skipped this match cycle because {market_label} is unlisted or suspended.*"
+                    )
+                    
+                    state['bet_placed'] = True
+                    LOCAL_TRACKED_MATCHES[fid] = state
+                    LOCAL_TRACKED_MATCHES.pop(fid, None)
+                    return
+                # ====================================================
+
+                # Continues safely only if valid liquid odds are available
                 stake, seq = calculate_stake()
                 data = {
                     'match_name': match_name,
@@ -233,8 +254,8 @@ def process_match(match):
                     'stake': stake,
                     'match_sequence': seq,
                     'bet_type': 'regular',
-                    'odds_bet365': odds_data.get('Bet365', 0.0),
-                    'odds_1xbet': odds_data.get('1xBet', 0.0)
+                    'odds_bet365': odds_b365,
+                    'odds_1xbet': odds_1x
                 }
 
                 firebase_manager.add_unresolved_bet(fid, data)
@@ -247,7 +268,7 @@ def process_match(match):
         state['bet_placed'] = True
 
     # =========================
-    # 2. HT CHECK (FIXED SINGLE-SHOT EXECUTION)
+    # 2. HT CHECK
     # =========================
     elif 'HALFTIME' in status and not state['processed_ht']:
         unresolved = firebase_manager.get_unresolved_bet(fid)
@@ -277,11 +298,8 @@ def process_match(match):
                 f"Score: {score}\n📊 PnL: ${unresolved['pnl']:.2f} ({unresolved['roi_percentage']}% ROI)"
             )
             
-            # FIX: Mutate execution check flag status so subsequent sleep cycles bypass re-evaluation
             state['processed_ht'] = True
             LOCAL_TRACKED_MATCHES[fid] = state
-            
-            # Safely scrub tracking index
             LOCAL_TRACKED_MATCHES.pop(fid, None)
 
 # =========================
