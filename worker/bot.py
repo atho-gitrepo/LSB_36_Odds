@@ -23,12 +23,16 @@ FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
 
 # --- CONFIGURATION SETTINGS ---
 MIN_PROBABILITY_THRESHOLD = 70.0  
-CHECK_INTERVAL_HOURS = 6 # Frequency multiplier interval for standard runs
+CHECK_INTERVAL_HOURS = 6 
 
 # --- LEAGUE FILTERS ---
 ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League', 'Copa Colombia']
 EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'Friendly']
 AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u1', 'u23', 'u21', 'u20', 'women', 'college']
+
+# Global instances for compatibility tracking
+firebase_manager = None
+SOFASCORE_CLIENT = None
 
 # =========================
 # FIREBASE STORAGE
@@ -112,7 +116,7 @@ def process_prematch_game(match):
         return
 
     # 2. Check Database Duplication Guardrail
-    if firebase_manager.is_match_already_logged(fid):
+    if firebase_manager and firebase_manager.is_match_already_logged(fid):
         logger.debug(f"[SKIP] Match {fid} already parsed and stored previously. Skipping lookup.")
         return
 
@@ -167,7 +171,7 @@ def process_prematch_game(match):
             highest_prob = away_prob
 
         # 6. Trigger if high-confidence pre-match selection is found
-        if dominant_team:
+        if dominant_team and firebase_manager:
             logger.info(f"🔥 [PRE-MATCH TRIGGER] High confidence threshold passed! {dominant_team} has {highest_prob}% pre-match expectation.")
             
             payload = {
@@ -218,38 +222,55 @@ def run_prematch_scan_cycle():
         logger.info(f"[CYCLE_EXEC] Scanning through {len(events)} pre-match fixtures against constraints...")
         for match in events:
             process_prematch_game(match)
-            # Short anti-scraping throttling step sequence
             time.sleep(1.2)
             
     except Exception as e:
         logger.error(f"[CYCLE_EXEC] ❌ Error caught inside the active loop execution processing thread: {e}", exc_info=True)
 
 # ======================================================================
-# 🔄 BACKWARD COMPATIBILITY ALIASES FOR MAIN.PY ORCHESTRATION LAYER
+# 🔄 BACKWARD COMPATIBILITY ALIASES & ORCHESTRATION LINKS FOR MAIN.PY
 # ======================================================================
+SLEEP_TIME = CHECK_INTERVAL_HOUES = CHECK_INTERVAL_HOURS * 3600 if 'CHECK_INTERVAL_HOURS' in locals() else 6 * 3600
 SLEEP_TIME = CHECK_INTERVAL_HOURS * 3600
 run_bot_cycle = run_prematch_scan_cycle
+
+def initialize_bot_services():
+    """
+    Exposed wrapper hook expected by main.py setup cycles.
+    Prepares both Firestore database mappings and web-scraping components.
+    """
+    global firebase_manager, SOFASCORE_CLIENT
+    logger.info("[INIT] Executing main.py orchestrated setup sequence...")
+    firebase_manager = FirebaseManager(FIREBASE_CREDENTIALS)
+    try:
+        logger.info("[INIT] Bootstrapping automated tracking browser engines...")
+        SOFASCORE_CLIENT = SofascoreClient()
+        SOFASCORE_CLIENT.initialize()
+        logger.info("✅ [INIT] Global tracking contexts are armed and online.")
+        return True
+    except Exception as e:
+        logger.error(f"❌ [INIT] Critical initialization error: {e}", exc_info=True)
+        return False
+
+def shutdown_bot():
+    logger.info("[SHUTDOWN] Terminating runtime infrastructure tasks...")
+    if SOFASCORE_CLIENT:
+        try: 
+            SOFASCORE_CLIENT.close()
+            logger.info("[SHUTDOWN] ✅ Browser client process pools closed down cleanly.")
+        except Exception as e: 
+            logger.error(f"[SHUTDOWN] Error terminating web socket resource links: {e}", exc_info=True)
 
 # =========================
 # SYSTEM ENTRY MAIN TRAP
 # =========================
 if __name__ == "__main__":
-    logger.info("🎬 Launching Pre-Match Win Probability Bot Application...")
-    firebase_manager = FirebaseManager(FIREBASE_CREDENTIALS)
-    
-    try:
-        logger.info("[INIT] Spinning up browser engine configuration layers...")
-        SOFASCORE_CLIENT = SofascoreClient()
-        SOFASCORE_CLIENT.initialize()
-        logger.info("🚀 Monitoring loops initialized successfully. System running pre-match scans.")
-        
-        while True:
-            run_prematch_scan_cycle()
-            logger.info(f"[SLEEP] Cycle execution complete. Next full pre-match scan in {CHECK_INTERVAL_HOURS} hours.")
-            time.sleep(SLEEP_TIME)
-            
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("[APP_INTERRUPT] Exit signal registered by system environment.")
-        if SOFASCORE_CLIENT: 
-            SOFASCORE_CLIENT.close()
-            logger.info("[SHUTDOWN] Browser resources decoupled cleanly.")
+    if initialize_bot_services():
+        try:
+            while True:
+                run_prematch_scan_cycle()
+                logger.info(f"[SLEEP] Cycle execution complete. Next full pre-match scan in {CHECK_INTERVAL_HOURS} hours.")
+                time.sleep(SLEEP_TIME)
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("[APP_INTERRUPT] Exit signal registered by system environment.")
+            shutdown_bot()
