@@ -27,8 +27,8 @@ CHECK_INTERVAL_HOURS = 6
 
 # --- LEAGUE FILTERS ---
 ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League', 'Copa Colombia']
-EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'Friendly']
-AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u1', 'u23', 'u21', 'u20', 'women', 'college']
+EXCLUDED_LEAGUES = ['England Amateur']
+AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'u1', 'u23', 'u21', 'u20', 'women', 'college']
 
 # Global instances for compatibility tracking
 firebase_manager = None
