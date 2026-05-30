@@ -125,8 +125,31 @@ def should_pre_warm(minute):
 def is_in_active_window(minute):
     return PRE_WARM_WINDOW[0] <= minute <= PRE_WARM_WINDOW[1]
 
+# ==========================================
+# SAFE CORNER EXTRACTION FUNCTION
+# ==========================================
+def get_live_1st_half_corners(match_id):
+    """
+    Queries SofascoreClient statistics payload directly and extracts
+    the exact 1st half corner totals using your match_stats data model fields.
+    """
+    try:
+        # Request full statistics payload using the event ID
+        stats_data = SOFASCORE_CLIENT.get_stats(match_id)
+        if not stats_data or not hasattr(stats_data, 'first_half') or stats_data.first_half is None:
+            return 0
+            
+        corner_item = stats_data.first_half.match_overview.corner_kicks
+        home_corners = corner_item.home_total if corner_item.home_total is not None else 0
+        away_corners = corner_item.away_total if corner_item.away_total is not None else 0
+        
+        return int(home_corners + away_corners)
+    except Exception as e:
+        logger.error(f"Error fetching Sofascore deep stats for match {match_id}: {e}")
+        return 0
+
 # =========================
-# MATCH PROCESS (PARLAY UPDATE)
+# MATCH PROCESS
 # =========================
 def process_match(match):
     fid = str(match.id)
@@ -159,23 +182,15 @@ def process_match(match):
 
     LOCAL_TRACKED_MATCHES[fid] = state
 
-    # =========================
-    # 1. PLACE PARLAY BET (TRIGGER DRIVEN)
-    # =========================
+    # =============================================
+    # 1. PLACE PARLAY BET (TRIGGER WINDOW ACTION)
+    # =============================================
     if '1ST' in status and min_elapsed in MINUTES_REGULAR_BET and not state['bet_placed']:
         if not firebase_manager.is_state_locked():
             
             if score in ['1-1', '2-2', '3-3']:
-                # Extract real-time live corner data safely from the match object properties
-                try:
-                    home_corners = int(getattr(match.home_stats, 'corners', 0))
-                    away_corners = int(getattr(match.away_stats, 'corners', 0))
-                except Exception:
-                    # Fallback default if nested stats objects are unmapped in payload structure
-                    home_corners = 0
-                    away_corners = 0
-                    
-                current_total_corners = home_corners + away_corners
+                # Pull correct corner values directly from match_stats.py schema model
+                current_total_corners = get_live_1st_half_corners(fid)
                 target_corner_line = float(current_total_corners + 0.5)
 
                 stake, seq = calculate_stake()
@@ -201,33 +216,28 @@ def process_match(match):
 
         state['bet_placed'] = True
 
-    # =========================
-    # 2. HT CHECK & SETTLEMENT
-    # =========================
+    # =============================================
+    # 2. HALFTIME CHECK & PARLAY EVALUATION
+    # =============================================
     elif 'HALFTIME' in status and not state['processed_ht']:
         unresolved = firebase_manager.get_unresolved_bet(fid)
 
         if unresolved:
-            # Extract final HT stats to evaluate the corner leg
-            try:
-                ht_home_corners = int(getattr(match.home_stats, 'corners', 0))
-                ht_away_corners = int(getattr(match.away_stats, 'corners', 0))
-                final_ht_corners = ht_home_corners + ht_away_corners
-            except Exception:
-                final_ht_corners = unresolved.get('trigger_corners', 0)
+            # Query fresh final half-time statistics payload
+            final_ht_corners = get_live_1st_half_corners(fid)
 
-            # Leg 1 Evaluation: Did score stay the same as our snapshot record?
+            # Leg 1: Trigger score matches the final half-time scoreline
             score_leg_win = (score == unresolved['trigger_score'])
             
-            # Leg 2 Evaluation: Did final corners clear our target baseline threshold?
+            # Leg 2: Total corners taken at halftime exceeds our +0.5 goal threshold line
             corner_leg_win = (float(final_ht_corners) > unresolved['target_corner_line'])
 
-            # Parlay wins ONLY if both conditions are met
+            # Parlay win conditions met
             parlay_win = score_leg_win and corner_leg_win
             outcome = 'win' if parlay_win else 'loss'
             
             stake = unresolved.get('stake', 0.0)
-            pnl = -stake if outcome == 'loss' else 0.0 # Note: Set static profit rule or dynamic tracking if tracking custom exchange Slips
+            pnl = -stake if outcome == 'loss' else 0.0 
 
             unresolved.update({
                 'final_ht_score': score,
@@ -239,12 +249,11 @@ def process_match(match):
 
             firebase_manager.move_to_resolved(fid, unresolved, outcome)
 
-            # Build readable verification summary telegram update
             status_emoji = '✅' if parlay_win else '❌'
             send_telegram(
                 f"{status_emoji} **PARLAY RESULT: {outcome.upper()}**\n{match_name}\n\n"
-                f"🎰 Score Leg: {unresolved['trigger_score']} -> Final HT Score: {score} ({unresolved['score_leg_result']})\n"
-                f"📐 Corner Leg: Target Over {unresolved['target_corner_line']} -> Final HT Corners: {final_ht_corners} ({unresolved['corner_leg_result']})\n\n"
+                f"🎰 Score Leg: {unresolved['trigger_score']} -> HT Score: {score} ({unresolved['score_leg_result']})\n"
+                f"📐 Corner Leg: Target Over {unresolved['target_corner_line']} -> HT Corners: {final_ht_corners} ({unresolved['corner_leg_result']})\n\n"
                 f"📊 Session PnL: ${unresolved['pnl']:.2f}"
             )
             
