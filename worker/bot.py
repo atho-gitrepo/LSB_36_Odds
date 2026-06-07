@@ -3,442 +3,468 @@ import os
 import json
 import time
 import logging
-import random
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
 from esd.sofascore import SofascoreClient
 
-# --- DETAILED LOGGING SETUP ---
+# --- LOGGING ---
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(name)s | [%(levelname)s] | %(message)s',
-    handlers=[logging.FileHandler("win_prob_prematch_trace.log"), logging.StreamHandler()]
+    format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
+    handlers=[logging.FileHandler("bot_activity.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger("WinProbPreMatchBot")
+logger = logging.getLogger("BetBot")
 
 # --- ENV VARS ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
 
-# --- CONFIGURATION SETTINGS ---
-MIN_PROBABILITY_THRESHOLD = 70.0  
-CHECK_INTERVAL_HOURS = 6 
+# --- SETTINGS ---
+ORIGINAL_STAKE = 10.0
+MAX_CHASE_LEVEL = 4
+SLEEP_TIME = 95
+MINUTES_REGULAR_BET = [35,36,37]
 
-# --- LEAGUE FILTERS ---
-ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League', 'Copa Colombia']
-EXCLUDED_LEAGUES = ['USA', 'Poland', 'Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'Friendly']
-AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u1', 'u23', 'u21', 'u20', 'women', 'college']
+# --- NEW: OVER 0.5 SETTINGS ---
+OVER05_TRIGGER_MINUTE = 20
+OVER05_STAKE = 10.0
+OVER05_CHECK_MINUTE = 45  # Check at halftime
 
-# Global instances
-firebase_manager = None
+# --- FILTERS ---
+ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League']
+EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'U19', 'U21', 'Friendly']
+AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u23', 'u21','u20', 'women', 'college']
+
+# --- SMART OPTIMIZATION SETTINGS ---
+PREDICT_START_MIN = 30
+PRE_WARM_WINDOW = (34, 38)
+MATCH_CACHE = {}
+
+# --- GLOBALS ---
 SOFASCORE_CLIENT = None
-
-# ======================================================================
-# 🛡️ STEALTH CLIENT INJECTION (Bypasses Cloudflare & Empty Stats 0.0%)
-# ======================================================================
-class PatchedSofascoreClient(SofascoreClient):
-    """
-    Overrides the baseline client to inject anti-fingerprinting parameters
-    and enforce a human-like UI anchoring sequence before reading raw JSON APIs.
-    """
-    def initialize(self):
-        # Call the original library init to spin up Playwright
-        super().initialize()
-        try:
-            from playwright_stealth import stealth_sync
-            # Inject stealth modifications directly into the active page object
-            if hasattr(self, 'service') and hasattr(self.service, 'page'):
-                stealth_sync(self.service.page)
-                logger.info("🛡️ [STEALTH_PATCH] Playwright Stealth applied directly to browser context.")
-        except ImportError:
-            logger.warning("⚠️ [STEALTH_PATCH] 'playwright-stealth' package missing. Running fallback parameters.")
-            if hasattr(self, 'service') and hasattr(self.service, 'page'):
-                self.service.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-    def get_stats(self, event_id):
-        """Overrides the stats grabber to hit the human UI page first as an anchor."""
-        try:
-            if hasattr(self, 'service') and hasattr(self.service, 'page'):
-                page = self.service.page
-                
-                # Step 1: Navigate to the human event details page to establish valid session cookies
-                human_url = f"https://www.sofascore.com/event/{event_id}"
-                logger.info(f"🕵️‍♂️ [STEALTH_NAV] Anchoring session context at UI layer: {human_url}")
-                
-                page.goto(human_url, timeout=30000, wait_until="domcontentloaded")
-                time.sleep(random.uniform(2.0, 4.5)) # Mimic natural human pacing delay
-                
-                # Step 2: Now target the raw internal win-probability API endpoint
-                api_url = f"https://www.sofascore.com/api/v1/event/{event_id}/win-probability"
-                logger.info(f"🕵️‍♂️ [STEALTH_NAV] Executing payload extraction request: {api_url}")
-                
-                page.goto(api_url, timeout=15000, wait_until="networkidle")
-                raw_content = page.locator("body").inner_text().strip()
-                
-                # Convert raw browser string back into structure
-                data_dict = json.loads(raw_content)
-                
-                # Return standard object expectations back to our processing loops
-                class Struct:
-                    def __init__(self, **entries): self.__dict__.update(entries)
-                
-                if 'winProbability' in data_dict:
-                    wp = data_dict['winProbability']
-                    prob_obj = Struct(
-                        home=wp.get('home'),
-                        draw=wp.get('draw'),
-                        away=wp.get('away')
-                    )
-                    return Struct(win_probability=prob_obj)
-            
-            # Fallback to standard library function if internal mapping references change
-            return super().get_stats(event_id)
-        except Exception as e:
-            logger.error(f"❌ [STEALTH_NAV] Intercept error on match {event_id}: {e}")
-            return None
+firebase_manager = None
+LOCAL_TRACKED_MATCHES = {}
+OVER05_TRACKED_MATCHES = {}  # NEW: Separate tracking for over 0.5 logic
 
 # =========================
-# FIREBASE STORAGE
+# FIREBASE
 # =========================
 class FirebaseManager:
     def __init__(self, creds_json):
         self.db = None
         if not creds_json:
-            logger.error("[FIREBASE_INIT] ❌ Firebase Credentials missing in environment variables!")
+            logger.error("Firebase Credentials missing!")
             return
         try:
-            logger.info("[FIREBASE_INIT] Attempting to parse credentials JSON string...")
             cred_dict = json.loads(creds_json)
             cred = credentials.Certificate(cred_dict)
             if not firebase_admin._apps:
                 firebase_admin.initialize_app(cred)
-                logger.info("[FIREBASE_INIT] Firebase SDK App initialized successfully.")
             self.db = firestore.client()
-            logger.info("Base connection to Firestore client established successfully.")
+            logger.info("✅ Firebase Connection Ready.")
         except Exception as e:
-            logger.error(f"❌ [FIREBASE_INIT] Critical Firebase initialization failure: {e}", exc_info=True)
+            logger.error(f"❌ Firebase Init Error: {e}")
 
-    def add_prematch_prediction(self, match_id, data):
-        """Saves high probability pre-match selections into Firestore."""
+    def is_state_locked(self):
         try:
-            if not self.db:
-                logger.warning(f"[DB_WRITE] ⚠️ Database connection not ready. Skipping logging for {match_id}")
-                return
-            data['logged_at'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-            data['status'] = 'PENDING_KICKOFF'
-            logger.info(f"[DB_WRITE] Writing pre-match favorite details for match {match_id}...")
-            self.db.collection('prematch_prob_bets').document(str(match_id)).set(data)
-            logger.info(f"[DB_WRITE] ✅ Successfully wrote match {match_id} to prematch_prob_bets collection.")
-        except Exception as e:
-            logger.error(f"[DB_WRITE] ❌ Error writing pre-match configuration document: {e}", exc_info=True)
-
-    def is_match_already_logged(self, match_id):
-        """Prevents processing or notifying the same pre-match game multiple times."""
-        try:
-            if not self.db: return False
-            logger.debug(f"[DB_READ] Checking duplication for match ID: {match_id}")
-            doc = self.db.collection('prematch_prob_bets').document(str(match_id)).get()
-            return doc.exists
-        except Exception as e:
-            logger.error(f"[DB_READ] ❌ Error fetching duplication check values for ID {match_id}: {e}", exc_info=True)
+            return len(self.db.collection('unresolved_bets').limit(1).get()) > 0
+        except:
             return False
 
+    def is_over05_state_locked(self):
+        """Check if there's an unresolved over 0.5 bet"""
+        try:
+            return len(self.db.collection('unresolved_over05_bets').limit(1).get()) > 0
+        except:
+            return False
+
+    def get_last_resolved_bet(self):
+        try:
+            query = self.db.collection('resolved_bets')\
+                .order_by('resolution_timestamp', direction=firestore.Query.DESCENDING)\
+                .limit(1).get()
+            for doc in query:
+                return doc.to_dict()
+        except:
+            return None
+
+    def get_last_resolved_over05_bet(self):
+        """Get last resolved over 0.5 bet for sequence tracking"""
+        try:
+            query = self.db.collection('resolved_over05_bets')\
+                .order_by('resolution_timestamp', direction=firestore.Query.DESCENDING)\
+                .limit(1).get()
+            for doc in query:
+                return doc.to_dict()
+        except:
+            return None
+
+    def add_unresolved_bet(self, match_id, data):
+        data['placed_at'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        self.db.collection('unresolved_bets').document(str(match_id)).set(data)
+
+    def add_unresolved_over05_bet(self, match_id, data):
+        """Add unresolved over 0.5 bet - separate collection"""
+        data['placed_at'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        self.db.collection('unresolved_over05_bets').document(str(match_id)).set(data)
+
+    def get_unresolved_bet(self, match_id):
+        doc = self.db.collection('unresolved_bets').document(str(match_id)).get()
+        return doc.to_dict() if doc.exists else None
+
+    def get_unresolved_over05_bet(self, match_id):
+        """Get unresolved over 0.5 bet"""
+        doc = self.db.collection('unresolved_over05_bets').document(str(match_id)).get()
+        return doc.to_dict() if doc.exists else None
+
+    def move_to_resolved(self, match_id, data, outcome):
+        data.update({
+            'outcome': outcome,
+            'resolved_at': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            'resolution_timestamp': firestore.SERVER_TIMESTAMP
+        })
+        self.db.collection('resolved_bets').document(str(match_id)).set(data)
+        self.db.collection('unresolved_bets').document(str(match_id)).delete()
+        return True
+
+    def move_over05_to_resolved(self, match_id, data, outcome):
+        """Move over 0.5 bet to resolved"""
+        data.update({
+            'outcome': outcome,
+            'resolved_at': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            'resolution_timestamp': firestore.SERVER_TIMESTAMP
+        })
+        self.db.collection('resolved_over05_bets').document(str(match_id)).set(data)
+        self.db.collection('unresolved_over05_bets').document(str(match_id)).delete()
+        return True
+
 # =========================
-# TELEGRAM NOTIFIER
+# TELEGRAM
 # =========================
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    logger.info("[TELEGRAM_API] Dispatching outgoing alert payload message packet...")
     try:
-        response = requests.post(
+        requests.post(
             url,
             data={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'},
             timeout=15
         )
-        if response.status_code == 200:
-            logger.info("[TELEGRAM_API] ✅ Selection notification delivered successfully.")
-        else:
-            logger.error(f"[TELEGRAM_API] ❌ Selection rejected by API endpoint: {response.text}")
-    except Exception as e:
-        logger.error(f"[TELEGRAM_API] ❌ Network level transport exception encountered: {e}", exc_info=True)
+    except:
+        pass
 
-# ==========================================
-# PRE-MATCH ANALYSIS CORE
-# ==========================================
-def process_prematch_game(match):
+# =========================
+# STAKE CALCULATION (Regular Sequence)
+# =========================
+def calculate_stake():
+    last = firebase_manager.get_last_resolved_bet()
+    if not last or last.get('outcome') == 'win':
+        return ORIGINAL_STAKE, 1
+    seq = last.get('match_sequence', 1)
+    if seq < MAX_CHASE_LEVEL:
+        return float(ORIGINAL_STAKE * (2**seq)), seq + 1
+    return ORIGINAL_STAKE, 1
+
+# =========================
+# STAKE CALCULATION (Over 0.5 Separate Sequence)
+# =========================
+def calculate_over05_stake():
+    """Separate chase sequence for over 0.5 bets"""
+    last = firebase_manager.get_last_resolved_over05_bet()
+    if not last or last.get('outcome') == 'win':
+        return OVER05_STAKE, 1
+    seq = last.get('match_sequence', 1)
+    if seq < MAX_CHASE_LEVEL:
+        return float(OVER05_STAKE * (2**seq)), seq + 1
+    return OVER05_STAKE, 1
+
+# =========================
+# SMART PREDICTION ENGINE
+# =========================
+def should_pre_warm(minute):
+    return minute >= PREDICT_START_MIN
+
+def is_in_active_window(minute):
+    return PRE_WARM_WINDOW[0] <= minute <= PRE_WARM_WINDOW[1]
+
+# =========================
+# MATCH PROCESS (UPDATED WITH OVER 0.5 LOGIC)
+# =========================
+def process_match(match):
     fid = str(match.id)
-    
-    # 1. Skip if it's already live or finished
-    try:
-        status_desc = match.status.description.upper() if match.status else "UNKNOWN"
-        if status_desc not in ['NOT STARTED', 'SCHEDULED']:
-            logger.debug(f"[SKIP] Match {fid} skipped because it has already kicked off (Status: {status_desc})")
-            return
-    except Exception as e:
-        logger.error(f"[MATCH_LIVE_ATTR] ❌ Error processing status checks for ID {fid}: {e}")
-        return
-
-    # 2. Check Database Duplication Guardrail
-    if firebase_manager and firebase_manager.is_match_already_logged(fid):
-        logger.debug(f"[SKIP] Match {fid} already parsed and stored previously. Skipping lookup.")
-        return
-
-    # 3. Parse Metadata safely
-    try:
-        league = match.tournament.name if match.tournament else "Unknown League"
-        country = match.tournament.category.name if match.tournament and match.tournament.category else "Unknown Country"
-        match_name = f"{match.home_team.name} vs {match.away_team.name}" if match.home_team and match.away_team else f"Match ID {fid}"
-        kickoff_ts = match.start_timestamp if hasattr(match, 'start_timestamp') else None
-        kickoff_time = datetime.utcfromtimestamp(kickoff_ts).strftime('%Y-%m-%d %H:%M UTC') if kickoff_ts else "Unknown"
-    except Exception as e:
-        logger.error(f"[PARSE_ERROR] Failed parsing basic structural attributes on match {fid}: {e}")
-        return
-
-    # 4. Filter Leagues
+    league = match.tournament.name
+    country = match.tournament.category.name
     full_info = f"{league} {country}".lower()
+
+    # basic filter
     if not any(x.lower() in league.lower() for x in ALLOWED_LEAGUES):
         if any(x.lower() in full_info for x in EXCLUDED_LEAGUES + AMATEUR_KEYWORDS):
-            logger.debug(f"[FILTER] Match {match_name} ({fid}) bypassed by tracking exclusion filters.")
             return
 
-    # 5. Fetch Pre-Match Probabilities
-    logger.info(f"[PREMATCH_CHECK] Evaluating pre-match matrix for: {match_name} ({fid})...")
-    try:
-        stats_data = SOFASCORE_CLIENT.get_stats(int(fid))
-        if not stats_data:
-            logger.warning(f"[PREMATCH_CHECK] Client returned empty stats container wrapper object for {match_name} ({fid})")
-            return
+    min_elapsed = match.total_elapsed_minutes
+    status = match.status.description.upper()
+    score = f"{match.home_score.current}-{match.away_score.current}"
+    home_score = match.home_score.current
+    away_score = match.away_score.current
+    total_goals = home_score + away_score
+
+    match_name = f"{match.home_team.name} vs {match.away_team.name}"
+
+    # =========================
+    # 🧠 SMART PRE-WARM LOGIC
+    # =========================
+    if not should_pre_warm(min_elapsed):
+        return
+
+    # REGULAR SEQUENCE TRACKING
+    state = LOCAL_TRACKED_MATCHES.get(fid, {
+        'bet_placed': False,
+        'last_seen': time.time(),
+        'active': False
+    })
+
+    state['last_seen'] = time.time()
+
+    if is_in_active_window(min_elapsed):
+        state['active'] = True
+
+    LOCAL_TRACKED_MATCHES[fid] = state
+
+    # =========================
+    # NEW: OVER 0.5 LOGIC (SEPARATE SEQUENCE)
+    # =========================
+    over05_state = OVER05_TRACKED_MATCHES.get(fid, {
+        'bet_placed': False,
+        'triggered': False,
+        'last_seen': time.time()
+    })
+
+    over05_state['last_seen'] = time.time()
+    OVER05_TRACKED_MATCHES[fid] = over05_state
+
+    # --- OVER 0.5 TRIGGER: Score 0-0 at exactly minute 20 ---
+    if (status == '1ST_HALF' or '1ST' in status) and \
+       min_elapsed == OVER05_TRIGGER_MINUTE and \
+       score == '0-0' and \
+       not over05_state['bet_placed'] and \
+       not firebase_manager.is_over05_state_locked():
+        
+        # Calculate stake from separate sequence
+        stake, seq = calculate_over05_stake()
+        
+        # Prepare bet data
+        bet_data = {
+            'match_name': match_name,
+            'league': league,
+            'country': country,
+            'trigger_score': score,
+            'trigger_minute': OVER05_TRIGGER_MINUTE,
+            'stake': stake,
+            'match_sequence': seq,
+            'bet_type': 'over_0.5'
+        }
+        
+        # Save to Firebase (separate collection)
+        firebase_manager.add_unresolved_over05_bet(fid, bet_data)
+        
+        # Send alert
+        send_telegram(
+            f"🎯 **OVER 0.5 BET PLACED (Seq {seq})**\n"
+            f"⏱ {OVER05_TRIGGER_MINUTE}' | {match_name}\n"
+            f"🌍 {country} | 🏆 {league}\n"
+            f"🔢 Score: {score}\n"
+            f"💰 Stake: ${stake:.2f}\n"
+            f"📊 Bet: Over 0.5 Goals"
+        )
+        
+        over05_state['bet_placed'] = True
+        OVER05_TRACKED_MATCHES[fid] = over05_state
+        
+        logger.info(f"🚀 Over 0.5 bet placed: {match_name} | {score} at {OVER05_TRIGGER_MINUTE}'")
+
+    # --- OVER 0.5 CHECK: At halftime ---
+    if 'HALFTIME' in status and over05_state['bet_placed']:
+        unresolved_over05 = firebase_manager.get_unresolved_over05_bet(fid)
+        
+        if unresolved_over05:
+            # Check if there were any goals in first half
+            outcome = 'win' if total_goals > 0 else 'loss'
             
-        if not hasattr(stats_data, 'win_probability') or stats_data.win_probability is None:
-            logger.warning(f"[PREMATCH_CHECK] Win probability metrics unavailable for pre-match game ID: {fid}")
-            return
-
-        prob = stats_data.win_probability
-        home_prob = float(prob.home) if prob.home is not None else 0.0
-        draw_prob = float(prob.draw) if prob.draw is not None else 0.0
-        away_prob = float(prob.away) if prob.away is not None else 0.0
-
-        logger.info(f"[PREMATCH_CHECK] Values loaded for {match_name} -> Home: {home_prob}%, Draw: {draw_prob}%, Away: {away_prob}%")
-
-        if home_prob == 0.0 and draw_prob == 0.0 and away_prob == 0.0:
-            logger.warning(f"[PREMATCH_CHECK] ⚠️ Match data read yielded pure zeros for {match_name}. WAF block might still be active.")
-            return
-
-        dominant_team = None
-        target_side = None
-        highest_prob = 0.0
-
-        if home_prob >= MIN_PROBABILITY_THRESHOLD:
-            dominant_team = match.home_team.name
-            target_side = 'HOME'
-            highest_prob = home_prob
-        elif away_prob >= MIN_PROBABILITY_THRESHOLD:
-            dominant_team = match.away_team.name
-            target_side = 'AWAY'
-            highest_prob = away_prob
-
-        # 6. Trigger if high-confidence pre-match selection is found
-        if dominant_team and firebase_manager:
-            logger.info(f"🔥 [PRE-MATCH TRIGGER] High confidence threshold passed! {dominant_team} has {highest_prob}% pre-match expectation.")
-            
-            payload = {
-                'match_name': match_name,
-                'league': league,
-                'country': country,
-                'kickoff_time': kickoff_time,
-                'dominant_team': dominant_team,
-                'target_side': target_side,
-                'predicted_probability': highest_prob,
-                'probabilities_prematch': {
-                    'home': home_prob,
-                    'draw': draw_prob,
-                    'away': away_prob
-                }
-            }
-            
-            firebase_manager.add_prematch_prediction(fid, payload)
+            firebase_manager.move_over05_to_resolved(fid, unresolved_over05, outcome)
             
             send_telegram(
-                f"📋 **PRE-MATCH HIGH PROBABILITY SELECTION**\n"
-                f"🏟 {match_name}\n"
-                f"🏆 {league} ({country})\n"
-                f"⏰ Kickoff: `{kickoff_time}`\n\n"
-                f"🔥 **Pre-Match Favorite:** {dominant_team}\n"
-                f"📈 **Win Probability:** `{highest_prob:.1f}%` \n\n"
-                f"📊 *Odds Split Consensus:*\n"
-                f"🏠 Home: {home_prob:.1f}% | 🤝 Draw: {draw_prob:.1f}% | 🚌 Away: {away_prob:.1f}%"
+                f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} OVER 0.5 HT\n"
+                f"{match_name}\n"
+                f"Score: {score} | Goals: {total_goals}\n"
+                f"Bet placed at {OVER05_TRIGGER_MINUTE}' with score 0-0"
+            )
+            
+            OVER05_TRACKED_MATCHES.pop(fid, None)
+            
+            logger.info(f"🔍 Over 0.5 result: {outcome} | {match_name} | Score: {score}")
+
+    # =========================
+    # 1. REGULAR SEQUENCE BET (UNCHANGED)
+    # =========================
+    if '1ST' in status and min_elapsed in MINUTES_REGULAR_BET and not state['bet_placed']:
+        if not firebase_manager.is_state_locked():
+            if score in ['1-1', '2-2', '3-3']:
+                stake, seq = calculate_stake()
+                data = {
+                    'match_name': match_name,
+                    'league': league,
+                    'country': country,
+                    '36_score': score,
+                    'stake': stake,
+                    'match_sequence': seq,
+                    'bet_type': 'regular'
+                }
+
+                firebase_manager.add_unresolved_bet(fid, data)
+
+                send_telegram(
+                    f"🎯 **REGULAR BET PLACED (Match {seq})**\n"
+                    f"⏱ 36' | {match_name}\n"
+                    f"🌍 {country} | 🏆 {league}\n"
+                    f"🔢 Score: {score}\n"
+                    f"💰 Stake: ${stake:.2f}"
+                )
+
+                state['bet_placed'] = True
+                LOCAL_TRACKED_MATCHES[fid] = state
+
+    # =========================
+    # 2. REGULAR HT CHECK (UNCHANGED)
+    # =========================
+    elif 'HALFTIME' in status and state['bet_placed']:
+        unresolved = firebase_manager.get_unresolved_bet(fid)
+
+        if unresolved:
+            outcome = 'win' if score == unresolved['36_score'] else 'loss'
+            firebase_manager.move_to_resolved(fid, unresolved, outcome)
+
+            send_telegram(
+                f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} REGULAR HT\n"
+                f"{match_name}\n"
+                f"Score: {score}"
             )
 
-    except Exception as e:
-        logger.error(f"[PREMATCH_CHECK] ❌ Exception occurred parsing deep client statistics engine for ID {fid}: {e}", exc_info=True)
+            LOCAL_TRACKED_MATCHES.pop(fid, None)
 
-# ========================================
-# RUNTIME ENVIRONMENT CYCLE CONTROLLER
-# ========================================
-def run_prematch_scan_cycle():
-    if not SOFASCORE_CLIENT: 
-        logger.error("[CYCLE_EXEC] ❌ Aborting routine loop cycle: Client object reference is set to None.")
-        return
-    try:
-        logger.info("[CYCLE_EXEC] Querying network layer for today's scheduled football fixtures...")
-        events = SOFASCORE_CLIENT.get_events(date="today", live=False)
-        if not events:
-            logger.info("[CYCLE_EXEC] No scheduled fixtures returned for today.")
-            return
-            
-        logger.info(f"[CYCLE_EXEC] Scanning through {len(events)} pre-match fixtures against constraints...")
-        for match in events:
-            process_prematch_game(match)
-            # Modest delay to reduce footprint profiling signatures
-            time.sleep(random.uniform(1.5, 3.0))
-            
-    except Exception as e:
-        logger.error(f"[CYCLE_EXEC] ❌ Error caught inside the active loop execution processing thread: {e}", exc_info=True)
+    # Cleanup old entries
+    cleanup_old_entries()
 
-# ======================================================================
-# 🏁 AUTOMATED POST-MATCH SETTLEMENT ENGINE
-# ======================================================================
-def check_and_settle_completed_matches(sofascore_client, f_manager):
-    """Scans Firestore for pending pre-match picks and marks them as WIN or LOSS."""
-    if not f_manager or not f_manager.db:
-        logger.warning("[SETTLEMENT] Firestore client instance not connected. Skipping cycle verification.")
-        return
+def cleanup_old_entries():
+    """Remove matches not seen for more than 10 minutes"""
+    current_time = time.time()
+    
+    # Clean regular matches
+    for fid in list(LOCAL_TRACKED_MATCHES.keys()):
+        if current_time - LOCAL_TRACKED_MATCHES[fid]['last_seen'] > 600:  # 10 minutes
+            LOCAL_TRACKED_MATCHES.pop(fid, None)
+    
+    # Clean over 0.5 matches
+    for fid in list(OVER05_TRACKED_MATCHES.keys()):
+        if current_time - OVER05_TRACKED_MATCHES[fid]['last_seen'] > 600:
+            OVER05_TRACKED_MATCHES.pop(fid, None)
 
-    logger.info("[SETTLEMENT] Fetching pending pre-match selections from database logs...")
-    try:
-        pending_picks = f_manager.db.collection('prematch_prob_bets').where('status', '==', 'PENDING_KICKOFF').stream()
-        pending_list = [doc for doc in pending_picks]
-        
-        if not pending_list:
-            logger.info("[SETTLEMENT] No pending matches require resolution updates right now.")
-            return
-
-        logger.info(f"[SETTLEMENT] Found {len(pending_list)} pending records to audit.")
-        for doc in pending_list:
-            match_id = doc.id
-            match_data = doc.to_dict()
-            match_name = match_data.get('match_name', f"ID {match_id}")
-            target_side = match_data.get('target_side')
-            dominant_team = match_data.get('dominant_team')
-
-            logger.info(f"[SETTLEMENT] Requesting validation payload block updates for match: {match_name} ({match_id})")
-            event_update = sofascore_client.get_event_by_id(int(match_id))
-            
-            if not event_update:
-                logger.warning(f"[SETTLEMENT] Target event document reference context missing for ID: {match_id}")
-                continue
-
-            status_desc = event_update.status.description.upper() if event_update.status else "UNKNOWN"
-            
-            if status_desc in ['ENDED', 'FT', 'FINISHED', 'COMPLETED']:
-                logger.info(f"🏁 [SETTLEMENT] Match {match_name} finished. Syncing final details...")
-                
-                home_score = event_update.home_score.current if event_update.home_score and event_update.home_score.current is not None else 0
-                away_score = event_update.away_score.current if event_update.away_score and event_update.away_score.current is not None else 0
-                score_str = f"{home_score}-{away_score}"
-                
-                outcome = 'LOSS'
-                if target_side == 'HOME' and home_score > away_score:
-                    outcome = 'WIN'
-                elif target_side == 'AWAY' and away_score > home_score:
-                    outcome = 'WIN'
-
-                logger.info(f"[SETTLEMENT] Result for {match_name}: {score_str} -> Calculated: {outcome}")
-
-                match_data.update({
-                    'status': outcome,
-                    'final_score': score_str,
-                    'home_final_score': home_score,
-                    'away_final_score': away_score,
-                    'resolved_at': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
-                    'resolution_timestamp': firestore.SERVER_TIMESTAMP
-                })
-
-                f_manager.db.collection('resolved_prob_bets').document(str(match_id)).set(match_data)
-                f_manager.db.collection('prematch_prob_bets').document(str(match_id)).delete()
-                logger.info(f"[SETTLEMENT] ✅ Record {match_id} safely archived into resolved data pool history.")
-
-                status_emoji = '✅' if outcome == 'WIN' else '❌'
-                send_telegram(
-                    f"{status_emoji} **PRE-MATCH SELECTION SETTLED: {outcome}**\n"
-                    f"{match_name}\n"
-                    f"🏆 {match_data.get('league')}\n\n"
-                    f"🎯 **Your Pick:** {dominant_team} ({match_data.get('predicted_probability'):.1f}% Win Prob)\n"
-                    f"🏁 **Final Score:** `{score_str}`\n"
-                    f"📝 **Status:** {'Selection won successfully!' if outcome == 'WIN' else 'Selection did not win.'}"
-                )
-            else:
-                logger.info(f"[SETTLEMENT] Match {match_name} is still actively pending execution in state: {status_desc}")
-
-    except Exception as e:
-        logger.error(f"[SETTLEMENT] ❌ Critical failure running automated math settlement tracking sequences: {e}", exc_info=True)
-
-
-# ======================================================================
-# 🔄 BACKWARD COMPATIBILITY ALIASES & ORCHESTRATION LINKS FOR MAIN.PY
-# ======================================================================
-SLEEP_TIME = CHECK_INTERVAL_HOURS * 3600
-run_bot_cycle = run_prematch_scan_cycle
-
+# =========================
+# INIT
+# =========================
 def initialize_bot_services():
-    """Exposed setup hook expected by main.py."""
     global firebase_manager, SOFASCORE_CLIENT
-    logger.info("[INIT] Executing main.py orchestrated initialization sequence...")
     firebase_manager = FirebaseManager(FIREBASE_CREDENTIALS)
+
     try:
-        logger.info("[INIT] Bootstrapping automated web monitoring browsers with custom Patched Engine...")
-        # Instantiating the patched local class instead of base library variant
-        SOFASCORE_CLIENT = PatchedSofascoreClient()
+        SOFASCORE_CLIENT = SofascoreClient()
         SOFASCORE_CLIENT.initialize()
-        logger.info("✅ [INIT] Global service structures are ready and armed.")
+        logger.info("✅ Sofascore initialized")
         return True
-    except Exception as e:
-        logger.error(f"❌ [INIT] Critical platform bootstrapping error: {e}", exc_info=True)
+    except:
         return False
 
+# =========================
+# SHUTDOWN
+# =========================
 def shutdown_bot():
-    logger.info("[SHUTDOWN] Terminating browser runtime loop contexts...")
     if SOFASCORE_CLIENT:
-        try: 
-            SOFASCORE_CLIENT.close()
-            logger.info("[SHUTDOWN] ✅ Closed active thread execution pools successfully.")
-        except Exception as e: 
-            logger.error(f"[SHUTDOWN] Failure disconnecting browser elements safely: {e}", exc_info=True)
-
-
-# ==================================
-# SYSTEM ENTRY MAIN DUAL ENGINE LOOP
-# ==================================
-if __name__ == "__main__":
-    if initialize_bot_services():
-        logger.info("🚀 Dual Engine Scheduler Running...")
-        
-        SETTLEMENT_CHECK_INTERVAL = 1800  # Scan finished games every 30 minutes
-        PREMATCH_SCAN_INTERVAL = 21600    # Scan today's fixture pipeline every 6 hours
-        
-        last_prematch_scan = 0
-        last_settlement_check = 0
-        
         try:
-            while True:
-                current_time = time.time()
-                
-                # Engine Task A: Process match result declarations
-                if current_time - last_settlement_check >= SETTLEMENT_CHECK_INTERVAL:
-                    logger.info("⏳ Scheduled Match Settlement Verification Sweep initializing...")
-                    check_and_settle_completed_matches(SOFASCORE_CLIENT, firebase_manager)
-                    last_settlement_check = current_time
-                
-                # Engine Task B: Scan upcoming morning match pipelines
-                if current_time - last_prematch_scan >= PREMATCH_SCAN_INTERVAL:
-                    logger.info("⏳ Scheduled Pre-Match Fixture Sweep initializing...")
-                    run_prematch_scan_cycle()
-                    last_prematch_scan = current_time
-                
-                time.sleep(10)
-                
-        except (KeyboardInterrupt, SystemExit):
-            logger.info("[APP_INTERRUPT] Received kill signal. Processing terminal cleanup tasks...")
-            shutdown_bot()
+            SOFASCORE_CLIENT.close()
+        except:
+            pass
+
+# =========================
+# STATUS REPORT
+# =========================
+def send_status_report():
+    """Send periodic status report"""
+    regular_tracked = len(LOCAL_TRACKED_MATCHES)
+    over05_tracked = len(OVER05_TRACKED_MATCHES)
+    regular_active = sum(1 for m in LOCAL_TRACKED_MATCHES.values() if m.get('active'))
+    
+    msg = f"📊 **Bot Status**\n"
+    msg += f"🔄 Regular: {regular_tracked} tracked ({regular_active} active)\n"
+    msg += f"⚽ Over 0.5: {over05_tracked} tracked\n"
+    msg += f"🔒 Regular Locked: {firebase_manager.is_state_locked()}\n"
+    msg += f"🔒 Over 0.5 Locked: {firebase_manager.is_over05_state_locked()}"
+    
+    send_telegram(msg)
+
+# =========================
+# MAIN CYCLE (OPTIMIZED)
+# =========================
+def run_bot_cycle():
+    if not SOFASCORE_CLIENT:
+        return
+
+    try:
+        events = SOFASCORE_CLIENT.get_events(live=True)
+
+        if not events:
+            logger.warning("No events received")
+            return
+
+        logger.info(f"Scanning {len(events)} live matches | Regular: {len(LOCAL_TRACKED_MATCHES)} | Over05: {len(OVER05_TRACKED_MATCHES)}")
+
+        for m in events:
+            process_match(m)
+
+    except Exception as e:
+        logger.error(f"Error in bot cycle: {e}")
+
+# =========================
+# MAIN ENTRY POINT
+# =========================
+if __name__ == "__main__":
+    logger.info("=" * 50)
+    logger.info("🚀 BETTING BOT STARTING")
+    logger.info("=" * 50)
+    logger.info(f"📊 Regular bets: Minutes {MINUTES_REGULAR_BET} | Scores: 1-1, 2-2, 3-3")
+    logger.info(f"⚽ Over 0.5 bets: Trigger at {OVER05_TRIGGER_MINUTE}' | Score: 0-0 | Check at HT")
+    logger.info(f"💰 Separate sequences for both strategies")
+    
+    if not initialize_bot_services():
+        logger.error("❌ Failed to initialize bot services")
+        exit(1)
+    
+    last_status_time = time.time()
+    
+    try:
+        while True:
+            run_bot_cycle()
+            
+            # Send status report every 30 minutes
+            if time.time() - last_status_time > 1800:
+                send_status_report()
+                last_status_time = time.time()
+            
+            time.sleep(SLEEP_TIME)
+            
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+    finally:
+        shutdown_bot()
+        logger.info("Bot shutdown complete")
