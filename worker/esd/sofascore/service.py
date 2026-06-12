@@ -12,7 +12,7 @@ import random
 
 from playwright.sync_api import sync_playwright
 from ..utils import get_today
-from .endpoints import SofascoreEndpoints
+from .endpoints import HybridEndpoints
 from .types import parse_events
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,7 @@ class SofascoreService:
 
     def __init__(self, *args, **kwargs):
         self.logger = logger
-        self.endpoints = SofascoreEndpoints()
+        self.endpoints = HybridEndpoints()
         self.playwright = None
         self.browser = None
         self.context = None
@@ -115,60 +115,94 @@ class SofascoreService:
             if self.playwright: self.playwright.stop()
         except: pass
 
+    # ----------------------------------------------------------------------
+    # 🔄 DATA STRUCTURE TRANSLATION ADAPTER FOR LIVESCORE
+    # ----------------------------------------------------------------------
+    def _normalize_livescore_events(self, livescore_data: dict) -> list:
+        """
+        Extracts raw items from nested stages to pass them directly 
+        to the universal hybrid parse_events pipeline.
+        """
+        extracted_events = []
+        if not livescore_data or "Stages" not in livescore_data:
+            return extracted_events
+            
+        for stage in livescore_data["Stages"]:
+            for event in stage.get("Events", []):
+                event["Stg"] = {"Nm": stage.get("Nm", "Unknown Tournament")}
+                extracted_events.append(event)
+                
+        return parse_events(extracted_events)
+
+    # ----------------------------------------------------------------------
+    # ⚽ TRACKING CORE CAPABILITIES WITH ACTIVE AUTO-SWITCH OVER
+    # ----------------------------------------------------------------------
     def get_live_events(self):
         try:
-            url = self.endpoints.live_events_endpoint
+            url = self.endpoints.get_live_events_endpoint(provider="sofascore")
             data = safe_fetch_json(self.page, url)
-            if not data or "events" not in data:
-                self.logger.warning("⚠️ Live events blocked")
-                return []
-            return parse_events(data["events"])
+            if data and "events" in data:
+                return parse_events(data["events"])
+            self.logger.warning("⚠️ SofaScore live events empty/blocked. Falling back to LiveScore...")
         except Exception as e:
-            self.logger.error(f"Live error: {e}")
+            self.logger.warning(f"SofaScore Live Fetch Failed: {e}. Trying LiveScore...")
+
+        try:
+            url = self.endpoints.get_live_events_endpoint(provider="livescore")
+            data = safe_fetch_json(self.page, url)
+            return self._normalize_livescore_events(data)
+        except Exception as e:
+            self.logger.error(f"❌ Both engines completely failed for live data extraction: {e}")
             return []
 
     def get_events(self, date="today"):
+        if date == "today": 
+            date = get_today()
+        
         try:
-            if date == "today": date = get_today()
-            url = self.endpoints.events_endpoint.format(date=date)
+            url = self.endpoints.get_events_endpoint(date=date, provider="sofascore")
             data = safe_fetch_json(self.page, url)
-            if not data or "events" not in data:
-                self.logger.warning("⚠️ Events blocked")
-                return []
-            return parse_events(data["events"])
+            if data and "events" in data:
+                return parse_events(data["events"])
+            self.logger.warning(f"⚠️ SofaScore date blocked for {date}. Falling back to LiveScore...")
         except Exception as e:
-            self.logger.error(f"Events error: {e}")
+            self.logger.warning(f"SofaScore Date Fetch Failed: {e}. Trying LiveScore...")
+
+        try:
+            livescore_date = date.replace("-", "")
+            url = self.endpoints.get_events_endpoint(date=livescore_date, provider="livescore")
+            data = safe_fetch_json(self.page, url)
+            return self._normalize_livescore_events(data)
+        except Exception as e:
+            self.logger.error(f"❌ Both engines completely failed for scheduling date {date}: {e}")
             return []
 
-    # ----------------------------------------------------------------------
-    # ✅ FIX: INJECTED SYNCHRONIZED STATISTICS NETWORK ENDPOINT RETRIEVERS
-    # ----------------------------------------------------------------------
-    def get_raw_statistics(self, event_id: int) -> list[dict[str, any]]:
-        """
-        Fetches the raw statistics JSON array from match_stats_endpoint.
-        """
+    def get_raw_statistics(self, event_id: int) -> dict | list:
         try:
-            url = self.endpoints.match_stats_endpoint(int(event_id))
+            url = self.endpoints.match_stats_endpoint(int(event_id), provider="sofascore")
             data = safe_fetch_json(self.page, url)
-            if not data or "statistics" not in data:
-                self.logger.warning(f"⚠️ Statistics payload empty or blocked for event: {event_id}")
-                return []
-            return data["statistics"]
+            if data and "statistics" in data:
+                return data["statistics"]
+            self.logger.warning(f"⚠️ SofaScore statistics empty/blocked for ID {event_id}. Trying LiveScore...")
         except Exception as e:
-            self.logger.error(f"Error fetching raw event stats for {event_id}: {e}")
-            return []
+            self.logger.warning(f"SofaScore Stats Extraction Failure for ID {event_id}: {e}")
+
+        try:
+            url = self.endpoints.match_stats_endpoint(str(event_id), provider="livescore")
+            data = safe_fetch_json(self.page, url)
+            return data if data else {}
+        except Exception as e:
+            self.logger.error(f"❌ Extraction methods exhausted. Stats for {event_id} failed: {e}")
+            return {}
 
     def get_raw_probabilities(self, event_id: int) -> dict[str, any]:
-        """
-        Fetches raw win/draw/away vote distribution using match_probabilities_endpoint.
-        """
         try:
-            url = self.endpoints.match_probabilities_endpoint(int(event_id))
+            url = self.endpoints.match_probabilities_endpoint(int(event_id), provider="sofascore")
             data = safe_fetch_json(self.page, url)
-            if not data:
-                self.logger.warning(f"⚠️ Probabilities payload empty or blocked for event: {event_id}")
-                return {}
-            return data
+            if data:
+                return data
+            self.logger.warning(f"⚠️ Probabilities context empty or blocked for event {event_id}.")
         except Exception as e:
-            self.logger.error(f"Error fetching raw probabilities for {event_id}: {e}")
-            return {}
+            self.logger.error(f"Error extracting SofaScore probability vectors for {event_id}: {e}")
+            
+        return {}
