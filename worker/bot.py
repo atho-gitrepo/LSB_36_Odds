@@ -33,9 +33,9 @@ OVER05_STAKE = 10.0
 OVER05_CHECK_MINUTE = 45  # Check at halftime
 
 # --- FILTERS ---
-ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League']
-EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'U19', 'U21', 'Friendly']
-AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u23', 'u21','u20', 'women', 'college']
+#ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League']
+#EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'U19', 'U21', 'Friendly']
+AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly','u16', 'u17','u18', 'u19', 'u21','u20', 'u22','u23', 'women', 'college']
 
 # --- SMART OPTIMIZATION SETTINGS ---
 PREDICT_START_MIN = 30
@@ -326,7 +326,7 @@ def process_match(match):
     # =========================
     if '1ST' in status and min_elapsed in MINUTES_REGULAR_BET and not state['bet_placed']:
         if not firebase_manager.is_state_locked():
-            if score in ['1-1', '2-2', '3-3']:
+            if score in ['1-1', '2-2', '2-1','2-0']:
                 logger.info(f"🎯 Regular bet condition met for {match_name} at {min_elapsed}' with score {score}")
                 stake, seq = calculate_stake()
                 data = {
