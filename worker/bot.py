@@ -33,8 +33,6 @@ OVER05_STAKE = 10.0
 OVER05_CHECK_MINUTE = 45  # Check at halftime
 
 # --- FILTERS ---
-#ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League']
-#EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'U19', 'U21', 'Friendly']
 AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly','u16', 'u17','u18', 'u19', 'u21','u20', 'u22','u23', 'women', 'college']
 
 # --- SMART OPTIMIZATION SETTINGS ---
@@ -205,10 +203,9 @@ def process_match(match):
     country = match.tournament.category.name
     full_info = f"{league} {country}".lower()
 
-    # basic filter
-    if not any(x.lower() in league.lower() for x in ALLOWED_LEAGUES):
-        if any(x.lower() in full_info for x in EXCLUDED_LEAGUES + AMATEUR_KEYWORDS):
-            return
+    # Filters out sub-tier or exhibition keywords while allowing all geographic leagues
+    if any(x.lower() in full_info for x in AMATEUR_KEYWORDS):
+        return
 
     min_elapsed = match.total_elapsed_minutes
     status = match.status.description.upper()
@@ -499,4 +496,3 @@ if __name__ == "__main__":
         logger.error(f"💥 Fatal error: {e}", exc_info=True)
     finally:
         shutdown_bot()
-        logger.info("Bot shutdown complete")
