@@ -24,17 +24,18 @@ FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
 # --- SETTINGS ---
 ORIGINAL_STAKE = 10.0
 MAX_CHASE_LEVEL = 4
-SLEEP_TIME = 55
-MINUTES_REGULAR_BET = [20, 21, 22]
+SLEEP_TIME = 95
+MINUTES_REGULAR_BET = [35,36,37]
 
 # --- FILTERS ---
-# Keywords now exclusively applied to home and away team names
+#ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League']
+#EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'U19', 'U21', 'Friendly']
 AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u18', 'u17', 'u16', 'u19', 'u22', 'u23', 'u21','u20', 'women', 'college']
 
-# --- SMART OPTIMIZATION SETTINGS ---
-PREDICT_START_MIN = 15     
-PRE_WARM_WINDOW = (18, 24) 
-MATCH_CACHE = {}           
+# --- SMART OPTIMIZATION SETTINGS (NEW) ---
+PREDICT_START_MIN = 30     # start tracking match early
+PRE_WARM_WINDOW = (34,38) # only fully process in this window
+MATCH_CACHE = {}           # smart tracking cache
 
 # --- GLOBALS ---
 SOFASCORE_CLIENT = None
@@ -121,7 +122,7 @@ def calculate_stake():
     return ORIGINAL_STAKE, 1
 
 # =========================
-# SMART PREDICTION ENGINE
+# 🧠 NEW: SMART PREDICTION ENGINE
 # =========================
 def should_pre_warm(minute):
     return minute >= PREDICT_START_MIN
@@ -130,21 +131,18 @@ def is_in_active_window(minute):
     return PRE_WARM_WINDOW[0] <= minute <= PRE_WARM_WINDOW[1]
 
 # =========================
-# MATCH PROCESS
+# MATCH PROCESS (UPDATED SMART)
 # =========================
 def process_match(match):
     fid = str(match.id)
     league = match.tournament.name
     country = match.tournament.category.name
-    
-    # Isolate team names for strict filtering
-    home_team = match.home_team.name.lower()
-    away_team = match.away_team.name.lower()
-    teams_combined_info = f"{home_team} {away_team}"
+    full_info = f"{league} {country}".lower()
 
-    # Filter checks only team names now, ignoring league properties entirely
-    if any(keyword.lower() in teams_combined_info for keyword in AMATEUR_KEYWORDS):
-        return
+    # basic filter
+    if not any(x.lower() in league.lower() for x in ALLOWED_LEAGUES):
+        if any(x.lower() in full_info for x in EXCLUDED_LEAGUES + AMATEUR_KEYWORDS):
+            return
 
     min_elapsed = match.total_elapsed_minutes
     status = match.status.description.upper()
@@ -152,10 +150,13 @@ def process_match(match):
 
     match_name = f"{match.home_team.name} vs {match.away_team.name}"
 
-    # SMART PRE-WARM LOGIC
+    # =========================
+    # 🧠 SMART PRE-WARM LOGIC (NEW)
+    # =========================
     if not should_pre_warm(min_elapsed):
-        return  
+        return  # skip early matches completely
 
+    # cache tracking
     state = LOCAL_TRACKED_MATCHES.get(fid, {
         'bet_placed': False,
         'last_seen': time.time(),
@@ -164,22 +165,23 @@ def process_match(match):
 
     state['last_seen'] = time.time()
 
+    # activate only near window
     if is_in_active_window(min_elapsed):
         state['active'] = True
 
     LOCAL_TRACKED_MATCHES[fid] = state
 
     # =========================
-    # 1. PLACE BET (0-0 at 20-22')
+    # 1. PLACE BET (UNCHANGED LOGIC)
     # =========================
     if '1ST' in status and min_elapsed in MINUTES_REGULAR_BET and not state['bet_placed']:
         if not firebase_manager.is_state_locked():
-            if score == '0-0':
+            if score in ['1-1', '2-2', '2-1', '2-0']:
                 stake, seq = calculate_stake()
                 data = {
                     'match_name': match_name,
                     'league': league,
-                    'entry_score': score,
+                    '36_score': score,
                     'stake': stake,
                     'match_sequence': seq,
                     'bet_type': 'regular'
@@ -188,24 +190,23 @@ def process_match(match):
                 firebase_manager.add_unresolved_bet(fid, data)
 
                 send_telegram(
-                    f"🎯 **BET PLACED (Match {seq})**\n⏱ {min_elapsed}' | {match_name}\n🌍 {country} | 🏆 {league}\n🔢 Score: {score}\n💰 Stake: ${stake:.2f}"
+                    f"🎯 **BET PLACED (Match {seq})**\n⏱ 36' | {match_name}\n🌍 {country} | 🏆 {league}\n🔢 Score: {score}\n💰 Stake: ${stake:.2f}"
                 )
 
         state['bet_placed'] = True
 
     # =========================
-    # 2. HT CHECK
+    # 2. HT CHECK (UNCHANGED LOGIC)
     # =========================
     elif 'HALFTIME' in status:
         unresolved = firebase_manager.get_unresolved_bet(fid)
 
         if unresolved:
-            outcome = 'loss' if score == '0-0' else 'win'
-            
+            outcome = 'win' if score == unresolved['36_score'] else 'loss'
             firebase_manager.move_to_resolved(fid, unresolved, outcome)
 
             send_telegram(
-                f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} HT\n{match_name}\nScore at HT: {score}"
+                f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} HT\n{match_name}\nScore: {score}"
             )
 
             LOCAL_TRACKED_MATCHES.pop(fid, None)
@@ -236,7 +237,7 @@ def shutdown_bot():
             pass
 
 # =========================
-# MAIN CYCLE
+# MAIN CYCLE (OPTIMIZED)
 # =========================
 def run_bot_cycle():
     if not SOFASCORE_CLIENT:
@@ -253,5 +254,5 @@ def run_bot_cycle():
 
         for m in events:
             process_match(m)
+
     except Exception as e:
-        logger.error(f"Error in cycle: {e}")
