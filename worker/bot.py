@@ -28,13 +28,11 @@ SLEEP_TIME = 95
 MINUTES_REGULAR_BET = [35,36,37]
 
 # --- FILTERS ---
-#ALLOWED_LEAGUES = ['Campeonato Brasileiro Série A', 'Segunda Division, Apertura', 'Copa do Brasil', 'Premier League']
-#EXCLUDED_LEAGUES = ['USA', 'Poland','Australia', 'Mexico', 'Wales', 'Germany', 'England Amateur', 'U19', 'U21', 'Friendly']
 AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u18', 'u17', 'u16', 'u19', 'u22', 'u23', 'u21','u20', 'women', 'college']
 
 # --- SMART OPTIMIZATION SETTINGS (NEW) ---
 PREDICT_START_MIN = 30     # start tracking match early
-PRE_WARM_WINDOW = (34,38) # only fully process in this window
+PRE_WARM_WINDOW = (34, 38) # only fully process in this window
 MATCH_CACHE = {}           # smart tracking cache
 
 # --- GLOBALS ---
@@ -139,10 +137,9 @@ def process_match(match):
     country = match.tournament.category.name
     full_info = f"{league} {country}".lower()
 
-    # basic filter
-    if not any(x.lower() in league.lower() for x in ALLOWED_LEAGUES):
-        if any(x.lower() in full_info for x in EXCLUDED_LEAGUES + AMATEUR_KEYWORDS):
-            return
+    # Basic filter: Only exclude amateur/youth keywords
+    if any(x.lower() in full_info for x in AMATEUR_KEYWORDS):
+        return
 
     min_elapsed = match.total_elapsed_minutes
     status = match.status.description.upper()
@@ -256,3 +253,4 @@ def run_bot_cycle():
             process_match(m)
 
     except Exception as e:
+        logger.error(f"Error in bot cycle: {e}")
