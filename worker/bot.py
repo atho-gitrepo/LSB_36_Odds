@@ -24,7 +24,7 @@ FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
 # --- SETTINGS ---
 ORIGINAL_STAKE = 10.0
 MAX_CHASE_LEVEL = 4
-SLEEP_TIME = 95
+SLEEP_TIME = 55  # ⚡ OPTIMIZED FROM 95 TO 55: Guarantees your bot won't jump completely over your 3-minute window
 MINUTES_REGULAR_BET = [35, 36, 37]
 
 # --- FILTERS ---
@@ -125,7 +125,6 @@ class FirebaseManager:
         })
         logger.info(f"🔄 Migrating Match ID {match_id} from unresolved -> resolved. Outcome: {outcome.upper()}")
         try:
-            # Batch operations or sequential write/delete
             self.db.collection('resolved_bets').document(str(match_id)).set(data)
             logger.info(f"✅ Added to 'resolved_bets' collection for ID {match_id}")
             self.db.collection('unresolved_bets').document(str(match_id)).delete()
@@ -215,12 +214,31 @@ def process_match(match):
     status = match.status.description.upper()
     score = f"{match.home_score.current}-{match.away_score.current}"
 
-    # Optimization Filter Gate
-    if not should_pre_warm(min_elapsed):
-        logger.debug(f"⏩ Skipping match processing '{match_name}' ({fid}). Current time {min_elapsed}' sits below tracking initialization window ({PREDICT_START_MIN}').")
+    # =========================================================================
+    # ⚡ PRODUCTION FIX: DATA NORMALIZATION LAYER (CRITICAL FOR LIVE FEED SYNCS)
+    # =========================================================================
+    effective_minute = min_elapsed
+    
+    # 1. Defend against data provider lag anomalies reporting high runtime minutes while still at HT
+    if status == 'HT' or 'HALF' in status:
+        logger.debug(f"ℹ️ Status matches Halftime signature. Overriding tracking clock evaluation down to 45'.")
+        effective_minute = 45
+
+    # 2. Defend against LiveScore raw numerical string updates (e.g. status matches literal string minutes "33")
+    is_first_half_phase = (
+        '1ST' in status or 
+        'HALF' in status or 
+        status == 'HT' or
+        (status.isdigit() and int(status) <= 45)
+    )
+    # =========================================================================
+
+    # Optimization Filter Gate (Verify using normalized timestamp definitions)
+    if not should_pre_warm(effective_minute):
+        logger.debug(f"⏩ Skipping match processing '{match_name}' ({fid}). Current time {effective_minute}' sits below tracking initialization window ({PREDICT_START_MIN}').")
         return  
 
-    logger.info(f"🔍 Analyzing match state: {match_name} | Min: {min_elapsed}' | Score: {score} | Status: {status}")
+    logger.info(f"🔍 Analyzing match state: {match_name} | Min: {min_elapsed}' (Eff: {effective_minute}') | Score: {score} | Status: {status}")
 
     # Synchronize internal tracking dictionary state updates
     state = LOCAL_TRACKED_MATCHES.get(fid, {
@@ -230,7 +248,7 @@ def process_match(match):
     })
     state['last_seen'] = time.time()
 
-    if is_in_active_window(min_elapsed):
+    if is_in_active_window(effective_minute):
         if not state['active']:
             logger.info(f"🔥 Match '{match_name}' has entered its active target evaluation window.")
         state['active'] = True
@@ -240,15 +258,16 @@ def process_match(match):
     # =========================
     # PHASE 1: BET PLACEMENT EVALUATION
     # =========================
-    if '1ST' in status and min_elapsed in MINUTES_REGULAR_BET and not state['bet_placed']:
-        logger.info(f"🎯 Execution Target Window Hit for '{match_name}' ({min_elapsed}'). Checking qualification criteria...")
+    # Fixed to utilize defensive phase tracking wrappers
+    if is_first_half_phase and (effective_minute in MINUTES_REGULAR_BET) and not state['bet_placed']:
+        logger.info(f"🎯 Execution Target Window Hit for '{match_name}' ({effective_minute}'). Checking qualification criteria...")
         
         if firebase_manager.is_state_locked():
             logger.warning(f"🚫 Qualification rejected for '{match_name}'. System is locked awaiting another unresolved wager resolution event.")
         else:
             logger.info(f"Target system metrics passed. Confirming score value line compatibility: [ {score} ]")
             if score in ['1-1', '2-2', '2-1', '2-0']:
-                logger.warning(f"⚡ MATCH QUALIFIED! Placing bet on '{match_name}' at minute {min_elapsed}' with live score line {score}!")
+                logger.warning(f"⚡ MATCH QUALIFIED! Placing bet on '{match_name}' at minute {effective_minute}' with live score line {score}!")
                 
                 stake, seq = calculate_stake()
                 data = {
@@ -262,7 +281,7 @@ def process_match(match):
 
                 firebase_manager.add_unresolved_bet(fid, data)
                 send_telegram(
-                    f"🎯 **BET PLACED (Match {seq})**\n⏱ {min_elapsed}' | {match_name}\n🌍 {country} | 🏆 {league}\n🔢 Score: {score}\n💰 Stake: ${stake:.2f}"
+                    f"🎯 **BET PLACED (Match {seq})**\n⏱ {effective_minute}' | {match_name}\n🌍 {country} | 🏆 {league}\n🔢 Score: {score}\n💰 Stake: ${stake:.2f}"
                 )
             else:
                 logger.info(f"❌ Score condition pattern did not meet rules for '{match_name}' (Score: {score}). Skipping bet trigger.")
@@ -273,7 +292,7 @@ def process_match(match):
     # =========================
     # PHASE 2: HALFTIME VALUE CHECK
     # =========================
-    elif 'HALFTIME' in status:
+    elif status == 'HT' or 'HALFTIME' in status:
         logger.debug(f"Match context state indicates HALFTIME status for ID {fid}. Querying resolution tracking flags...")
         unresolved = firebase_manager.get_unresolved_bet(fid)
 
