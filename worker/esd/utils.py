@@ -1,5 +1,5 @@
 """
-Utility functions for Sofascore bot (safe version - Playwright only)
+Utility functions for Sofascore bot (Optimized API Version - Non-Blocking)
 """
 
 import re
@@ -7,7 +7,7 @@ import time
 import json
 import logging
 from datetime import datetime
-from playwright.sync_api import Page
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +39,17 @@ def camel_to_snake(name: str) -> str:
 
 
 # --------------------------------------------------
-# SAFE JSON FETCH (PLAYWRIGHT ONLY)
+# SAFE JSON FETCH (LIGHTWEIGHT REQUESTS CONVERSION)
 # --------------------------------------------------
 
-def get_json(page: Page, url: str, timeout: int = 30000) -> dict:
+def get_json(url: str, timeout: int = 30) -> dict:
     """
-    Fetch JSON safely using Playwright (ANTI-BLOCK VERSION)
+    Fetch JSON cleanly using requests connection pools.
+    Signature adapted to eliminate Playwright footprint dependencies.
 
     Args:
-        page (Page): Playwright page instance (REQUIRED)
         url (str): API URL
-        timeout (int): request timeout
+        timeout (int): request timeout in seconds
 
     Returns:
         dict: parsed JSON response
@@ -57,31 +57,27 @@ def get_json(page: Page, url: str, timeout: int = 30000) -> dict:
     Raises:
         RuntimeError: if blocked or invalid response
     """
-
-    if page is None:
-        raise RuntimeError("❌ Playwright page is required (direct API disabled)")
+    # Standard enterprise user-agent to mask programmatic footprints
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
 
     try:
-        # Navigate safely
-        page.goto(url, timeout=timeout, wait_until="domcontentloaded")
-
-        content = page.content()
+        response = requests.get(url, headers=headers, timeout=timeout)
 
         # 🚨 Detect blocking
-        if any(x in content.lower() for x in ["access denied", "forbidden", "cloudflare"]):
-            raise RuntimeError("🚫 Blocked by Sofascore")
+        if response.status_code in [403, 429]:
+            raise RuntimeError(f"🚫 Blocked by provider. Status Code: {response.status_code}")
 
-        # Extract JSON text
-        text = page.evaluate("() => document.body.innerText")
-
-        if not text:
+        if not response.text:
             raise RuntimeError("❌ Empty response body")
 
         # Parse JSON
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            raise RuntimeError("❌ Invalid JSON response")
+            data = response.json()
+        except Exception:
+            raise RuntimeError("❌ Invalid JSON response parsed from target body stream")
 
         # Optional API error handling
         if isinstance(data, dict) and "error" in data:
