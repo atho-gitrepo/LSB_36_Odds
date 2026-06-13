@@ -24,7 +24,7 @@ FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
 # --- SETTINGS ---
 ORIGINAL_STAKE = 10.0
 MAX_CHASE_LEVEL = 4
-SLEEP_TIME = 55  # ⚡ OPTIMIZED FROM 95 TO 55: Guarantees your bot won't jump completely over your 3-minute window
+SLEEP_TIME = 55  # ⚡ PITCH OPTIMIZED: Guarantees sampling inside the 3-minute window
 MINUTES_REGULAR_BET = [35, 36, 37]
 
 # --- FILTERS ---
@@ -210,35 +210,38 @@ def process_match(match):
         logger.debug(f"⏩ Dropping match '{match_name}' ({fid}). Matched restricted amateur keyword constraint rules.")
         return
 
-    min_elapsed = match.total_elapsed_minutes
     status = match.status.description.upper()
     score = f"{match.home_score.current}-{match.away_score.current}"
 
     # =========================================================================
-    # ⚡ PRODUCTION FIX: DATA NORMALIZATION LAYER (CRITICAL FOR LIVE FEED SYNCS)
+    # 🎯 FIX: EXCLUSIVE FOCUS ON LIVE MATCH PITCH TIME ONLY
     # =========================================================================
-    effective_minute = min_elapsed
-    
-    # 1. Defend against data provider lag anomalies reporting high runtime minutes while still at HT
-    if status == 'HT' or 'HALF' in status:
-        logger.debug(f"ℹ️ Status matches Halftime signature. Overriding tracking clock evaluation down to 45'.")
-        effective_minute = 45
+    live_pitch_minute = None
+    is_first_half_phase = False
 
-    # 2. Defend against LiveScore raw numerical string updates (e.g. status matches literal string minutes "33")
-    is_first_half_phase = (
-        '1ST' in status or 
-        'HALF' in status or 
-        status == 'HT' or
-        (status.isdigit() and int(status) <= 45)
-    )
-    # =========================================================================
+    if status.isdigit():
+        live_pitch_minute = int(status)
+        if live_pitch_minute <= 45:
+            is_first_half_phase = True
+    elif status == 'HT' or 'HALFTIME' in status or 'HALF' in status:
+        live_pitch_minute = 45
+        is_first_half_phase = True
+    elif '1ST' in status:
+        is_first_half_phase = True
+        live_pitch_minute = match.total_elapsed_minutes  # fallback calculation only if digital block missing
 
-    # Optimization Filter Gate (Verify using normalized timestamp definitions)
-    if not should_pre_warm(effective_minute):
-        logger.debug(f"⏩ Skipping match processing '{match_name}' ({fid}). Current time {effective_minute}' sits below tracking initialization window ({PREDICT_START_MIN}').")
+    # If the live pitch time could not be parsed, or it's clearly a 2nd half status string, ignore it.
+    if live_pitch_minute is None:
+        logger.debug(f"⏩ Skipping match processing '{match_name}' ({fid}). Cannot determine live pitch minute from status: {status}")
+        return
+
+    # Optimization Filter Gate (Now strictly tracking actual pitch minutes)
+    if not should_pre_warm(live_pitch_minute):
+        logger.debug(f"⏩ Skipping match processing '{match_name}' ({fid}). Live pitch clock {live_pitch_minute}' sits below tracking threshold.")
         return  
 
-    logger.info(f"🔍 Analyzing match state: {match_name} | Min: {min_elapsed}' (Eff: {effective_minute}') | Score: {score} | Status: {status}")
+    # CLEAN LOGS: Output relies entirely on the precise physical match timer
+    logger.info(f"🔍 Analyzing match state: {match_name} | Live Min: {live_pitch_minute}' | Score: {score} | Status: {status}")
 
     # Synchronize internal tracking dictionary state updates
     state = LOCAL_TRACKED_MATCHES.get(fid, {
@@ -248,26 +251,25 @@ def process_match(match):
     })
     state['last_seen'] = time.time()
 
-    if is_in_active_window(effective_minute):
+    if is_in_active_window(live_pitch_minute):
         if not state['active']:
             logger.info(f"🔥 Match '{match_name}' has entered its active target evaluation window.")
         state['active'] = True
 
     LOCAL_TRACKED_MATCHES[fid] = state
 
-    # =========================
-    # PHASE 1: BET PLACEMENT EVALUATION
-    # =========================
-    # Fixed to utilize defensive phase tracking wrappers
-    if is_first_half_phase and (effective_minute in MINUTES_REGULAR_BET) and not state['bet_placed']:
-        logger.info(f"🎯 Execution Target Window Hit for '{match_name}' ({effective_minute}'). Checking qualification criteria...")
+    # =========================================================================
+    # PHASE 1: BET PLACEMENT EVALUATION (STRICT LIVE PITCH TIME ONLY)
+    # =========================================================================
+    if is_first_half_phase and (live_pitch_minute in MINUTES_REGULAR_BET) and not state['bet_placed']:
+        logger.info(f"🎯 Execution Target Window Hit for '{match_name}' (Live Pitch Min: {live_pitch_minute}'). Checking qualification criteria...")
         
         if firebase_manager.is_state_locked():
             logger.warning(f"🚫 Qualification rejected for '{match_name}'. System is locked awaiting another unresolved wager resolution event.")
         else:
             logger.info(f"Target system metrics passed. Confirming score value line compatibility: [ {score} ]")
             if score in ['1-1', '2-2', '2-1', '2-0']:
-                logger.warning(f"⚡ MATCH QUALIFIED! Placing bet on '{match_name}' at minute {effective_minute}' with live score line {score}!")
+                logger.warning(f"⚡ MATCH QUALIFIED! Placing bet on '{match_name}' at live pitch minute {live_pitch_minute}' with live score line {score}!")
                 
                 stake, seq = calculate_stake()
                 data = {
@@ -281,7 +283,7 @@ def process_match(match):
 
                 firebase_manager.add_unresolved_bet(fid, data)
                 send_telegram(
-                    f"🎯 **BET PLACED (Match {seq})**\n⏱ {effective_minute}' | {match_name}\n🌍 {country} | 🏆 {league}\n🔢 Score: {score}\n💰 Stake: ${stake:.2f}"
+                    f"🎯 **BET PLACED (Match {seq})**\n⏱ Real Min: {live_pitch_minute}' | {match_name}\n🌍 {country} | 🏆 {league}\n🔢 Score: {score}\n💰 Stake: ${stake:.2f}"
                 )
             else:
                 logger.info(f"❌ Score condition pattern did not meet rules for '{match_name}' (Score: {score}). Skipping bet trigger.")
