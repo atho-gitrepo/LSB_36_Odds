@@ -24,7 +24,7 @@ FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
 # --- SETTINGS ---
 ORIGINAL_STAKE = 10.0
 MAX_CHASE_LEVEL = 4
-SLEEP_TIME = 95
+SLEEP_TIME = 55
 MINUTES_REGULAR_BET = [35,36,37]
 
 # --- NEW: OVER 0.5 SETTINGS ---
@@ -36,8 +36,8 @@ OVER05_CHECK_MINUTE = 45  # Check at halftime
 AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly','u16', 'u17','u18', 'u19', 'u21','u20', 'u22','u23', 'women', 'college']
 
 # --- SMART OPTIMIZATION SETTINGS ---
-PREDICT_START_MIN = 30
-PRE_WARM_WINDOW = (34, 38)
+PREDICT_START_MIN = 20
+PRE_WARM_WINDOW = (20,38)
 MATCH_CACHE = {}
 
 # --- GLOBALS ---
