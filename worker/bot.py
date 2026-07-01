@@ -208,23 +208,22 @@ def extract_hybrid_geography(match) -> tuple[str, str, str]:
         # Try Stg (Stage) data first - this is the most reliable for Livescore
         if "Stg" in match and isinstance(match["Stg"], dict):
             stage = match["Stg"]
-            # Try all possible fields for tournament name
+            # CRITICAL FIX: Get tournament name from Snm (Stage Name)
             tournament_name = (
-                stage.get("CompN") or      # Competition Name
-                stage.get("Nm") or          # Stage Name
-                stage.get("name") or
+                stage.get("Snm") or      # Stage Name - THIS IS THE TOURNAMENT NAME!
+                stage.get("CompN") or    # Competition Name (World Cup, etc.)
+                stage.get("Nm") or
                 "Unknown League"
             )
             
-            # If still unknown, check Category
-            if tournament_name == "Unknown League" and "Category" in stage:
-                category = stage["Category"]
-                if isinstance(category, dict):
-                    tournament_name = category.get("Nm") or category.get("Name") or "Unknown League"
+            # If still unknown, check if there's a tournament name in the event itself
+            if tournament_name == "Unknown League":
+                tournament_name = match.get("Snm") or match.get("CompN") or "Unknown League"
         
         # If no Stg data, try direct fields
         if tournament_name == "Unknown League":
             tournament_name = (
+                match.get("Snm") or
                 match.get("CompN") or
                 match.get("league") or
                 match.get("tournament") or
