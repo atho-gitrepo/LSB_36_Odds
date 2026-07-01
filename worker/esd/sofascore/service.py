@@ -57,6 +57,10 @@ class SofascoreService:
         """
         Low-overhead HTTP connection routine with dynamic header profiles and error recovery.
         """
+        if not url:
+            self.logger.warning(f"⚠️ Empty URL for provider {provider}, skipping request")
+            return None
+            
         profile = self.endpoints.get_provider_profile(provider)
         headers = profile["headers"]
         timeout = profile["timeout"]
@@ -144,7 +148,9 @@ class SofascoreService:
         try:
             url, params = self.endpoints.get_live_events_endpoint(provider="livescore")
             data = self.safe_fetch_json(url, params, provider="livescore")
-            return self._normalize_livescore_events(data)
+            if data:
+                return self._normalize_livescore_events(data)
+            return []
         except Exception as e:
             self.logger.error(f"❌ Both engines completely failed for live data extraction: {e}")
             return []
@@ -165,7 +171,9 @@ class SofascoreService:
         try:
             url, params = self.endpoints.get_events_endpoint(date=date, provider="livescore")
             data = self.safe_fetch_json(url, params, provider="livescore")
-            return self._normalize_livescore_events(data)
+            if data:
+                return self._normalize_livescore_events(data)
+            return []
         except Exception as e:
             self.logger.error(f"❌ Both engines completely failed for scheduling date {date}: {e}")
             return []
@@ -203,14 +211,12 @@ class SofascoreService:
     def get_event(self, event_id: int) -> dict | None:
         """
         Fetch detailed event information for a specific match ID.
-        Attempts SofaScore first, then falls back to LiveScore.
         """
         try:
             url, params = self.endpoints.event_endpoint(int(event_id), provider="sofascore")
             data = self.safe_fetch_json(url, params, provider="sofascore")
             if data:
                 return data
-            self.logger.warning(f"⚠️ SofaScore event {event_id} empty/blocked. Trying LiveScore...")
         except Exception as e:
             self.logger.warning(f"SofaScore Event Fetch Failed for {event_id}: {e}")
 
@@ -231,7 +237,6 @@ class SofascoreService:
             data = self.safe_fetch_json(url, params, provider="sofascore")
             if data:
                 return data
-            self.logger.warning(f"⚠️ SofaScore player {player_id} empty/blocked. Trying LiveScore...")
         except Exception as e:
             self.logger.warning(f"SofaScore Player Fetch Failed for {player_id}: {e}")
 
@@ -249,7 +254,6 @@ class SofascoreService:
         """
         results = []
         
-        # Try SofaScore
         try:
             url, params = self.endpoints.search_endpoint(query, entity, provider="sofascore")
             data = self.safe_fetch_json(url, params, provider="sofascore")
@@ -258,7 +262,6 @@ class SofascoreService:
         except Exception as e:
             self.logger.warning(f"SofaScore search failed: {e}")
 
-        # Try LiveScore
         try:
             url, params = self.endpoints.search_endpoint(query, entity, provider="livescore")
             data = self.safe_fetch_json(url, params, provider="livescore")
@@ -268,25 +271,3 @@ class SofascoreService:
             self.logger.warning(f"LiveScore search failed: {e}")
 
         return results
-
-    def get_tournament(self, tournament_id: int) -> dict | None:
-        """
-        Fetch tournament details including country information.
-        """
-        try:
-            # Try to get tournament details from SofaScore
-            url = f"{self.endpoints.sofa_base}/unique-tournament/{tournament_id}"
-            data = self.safe_fetch_json(url, {}, provider="sofascore")
-            if data:
-                return data
-        except Exception as e:
-            self.logger.warning(f"SofaScore tournament fetch failed: {e}")
-
-        try:
-            # Try LiveScore
-            url = f"{self.endpoints.live_base}/competitions/soccer/{tournament_id}"
-            data = self.safe_fetch_json(url, {}, provider="livescore")
-            return data
-        except Exception as e:
-            self.logger.error(f"Both engines failed for tournament {tournament_id}: {e}")
-            return None
