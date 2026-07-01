@@ -11,5 +11,6 @@ firebase-admin
 httpx
 lxml
 websocket-client>=1.6.0
+prmometheus_client
 # This assumes 'esd.sofascore' is installed as a local package or symlinked
 # For simple local use/Railway, you just need the dependencies:
