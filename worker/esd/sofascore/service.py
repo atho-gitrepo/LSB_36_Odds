@@ -112,50 +112,61 @@ class SofascoreService:
         self.logger.info(f"📊 Found {len(livescore_data['Stages'])} stages in Livescore response")
         
         for stage in livescore_data["Stages"]:
-            # Log ALL fields in the stage to see what's available
-            self.logger.info(f"📋 Stage fields: {list(stage.keys())}")
-            self.logger.info(f"📋 Stage data: Nm={stage.get('Nm')}, CompN={stage.get('CompN')}, Cnm={stage.get('Cnm')}, Tid={stage.get('Tid')}")
+            # CRITICAL FIX: Get tournament name from Snm (Stage Name)
+            # Snm is the actual tournament/league name in Livescore
+            tournament_name = stage.get("Snm")  # Stage Name - THIS IS THE TOURNAMENT NAME!
+            
+            # If Snm is None, try other fields
+            if not tournament_name:
+                tournament_name = stage.get("CompN")  # Competition Name (World Cup, etc.)
+            if not tournament_name:
+                tournament_name = stage.get("Nm")  # Fallback
+            if not tournament_name:
+                tournament_name = "Unknown Tournament"
+            
+            # Get country name from Cnm
+            country_name = stage.get("Cnm") or "World"
+            
+            # Log what we're extracting
+            self.logger.info(f"📋 Extracted: Tournament='{tournament_name}', Country='{country_name}'")
             
             # Preserve ALL stage data as-is from Livescore
             stage_data = {
-                "Nm": stage.get("Nm"),           # Stage/Tournament name
-                "Tid": stage.get("Tid"),         # Tournament ID
-                "Cid": stage.get("Cid"),         # Category/Country ID  
-                "Cnm": stage.get("Cnm"),         # Category/Country Name
-                "Ccd": stage.get("Ccd"),         # Country Code
-                "Rgn": stage.get("Rgn"),         # Region
-                "CompN": stage.get("CompN"),     # Competition Name
-                "CompId": stage.get("CompId"),   # Competition ID
-                "Category": stage.get("Category") # Category object
+                "Sid": stage.get("Sid"),           # Stage ID
+                "Snm": stage.get("Snm"),           # Stage Name - THIS IS THE TOURNAMENT NAME
+                "Scd": stage.get("Scd"),           # Stage Code
+                "Cnm": stage.get("Cnm"),           # Country Name
+                "CnmT": stage.get("CnmT"),         # Country Name Translated
+                "Csnm": stage.get("Csnm"),         # Country Short Name
+                "Ccd": stage.get("Ccd"),           # Country Code
+                "Scu": stage.get("Scu"),           # Stage URL
+                "CompN": stage.get("CompN"),       # Competition Name
+                "CompId": stage.get("CompId"),     # Competition ID
+                "CompCnmt": stage.get("CompCnmt"), # Competition Name Translated
+                "CompUrlName": stage.get("CompUrlName"), # Competition URL Name
+                "CompD": stage.get("CompD"),       # Competition Description
+                "badgeUrl": stage.get("badgeUrl"), # Badge URL
+                "Feed": stage.get("Feed"),         # Feed
+                "Games": stage.get("Games"),       # Games
+                "Events": stage.get("Events")      # Events
             }
             
             # Remove None values to keep data clean
             stage_data = {k: v for k, v in stage_data.items() if v is not None}
-            
-            # If no CompN but there's a Category object, try to get it from there
-            if "CompN" not in stage_data and "Category" in stage:
-                category = stage["Category"]
-                if isinstance(category, dict):
-                    if "CompN" in category:
-                        stage_data["CompN"] = category["CompN"]
-                    if "Nm" in category and "Nm" not in stage_data:
-                        stage_data["Nm"] = category["Nm"]
-                    if "Cnm" in category and "Cnm" not in stage_data:
-                        stage_data["Cnm"] = category["Cnm"]
             
             for event in stage.get("Events", []):
                 # Attach the full stage data to the event
                 event["Stg"] = stage_data
                 
                 # Also promote key fields to event level for easier access
+                if "Snm" in stage_data:
+                    event["Snm"] = stage_data["Snm"]  # Tournament name
                 if "Cnm" in stage_data:
-                    event["Cnm"] = stage_data["Cnm"]
+                    event["Cnm"] = stage_data["Cnm"]  # Country name
                 if "CompN" in stage_data:
                     event["CompN"] = stage_data["CompN"]
                 if "Ccd" in stage_data:
                     event["Ccd"] = stage_data["Ccd"]
-                if "Nm" in stage_data:
-                    event["Nm"] = stage_data["Nm"]
                 
                 extracted_events.append(event)
                 
