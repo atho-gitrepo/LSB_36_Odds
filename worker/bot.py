@@ -51,7 +51,8 @@ COUNTRY_FLAGS = {
     "saudi arabia": "🇸🇦", "qatar": "🇶🇦", "uae": "🇦🇪", "china": "🇨🇳",
     "egypt": "🇪🇬", "nigeria": "🇳🇬", "south africa": "🇿🇦", "chile": "🇨🇱",
     "colombia": "🇨🇴", "peru": "🇵🇪", "uruguay": "🇺🇾", "paraguay": "🇵🇾",
-    "ecuador": "🇪🇨", "venezuela": "🇻🇪", "bolivia": "🇧🇴", "costarica": "🇨🇷"
+    "ecuador": "🇪🇨", "venezuela": "🇻🇪", "bolivia": "🇧🇴", "costarica": "🇨🇷",
+    "finland": "🇫🇮", "world": "🌍"
 }
 
 # =========================
@@ -182,13 +183,15 @@ def prune_volatile_cache_leaks():
         logger.info(f"🧹 Automated Memory Clean: Evicted {len(stale_keys)} stale match contexts from memory maps.")
 
 # ==========================================
-# HYBRID PARSING WRAPPER FOR GEOGRAPHY - FIXED
+# HYBRID PARSING WRAPPER FOR GEOGRAPHY
 # ==========================================
 def extract_hybrid_geography(match) -> tuple[str, str, str]:
     """
     Resolves league and country data structures across both 
     Sofascore object types and LiveScore payload mappings.
     Returns: (league_name, country_name, country_slug)
+    
+    Uses actual data from the API responses, not keyword guessing.
     """
     # 1. Handle object-oriented payload formats (Sofascore)
     if hasattr(match, 'tournament'):
@@ -199,74 +202,38 @@ def extract_hybrid_geography(match) -> tuple[str, str, str]:
 
     # 2. Handle structural dictionary payload formats (LiveScore)
     if isinstance(match, dict):
-        # 🎯 FIX: Properly extract tournament data from Livescore event
+        # Get tournament/league name from actual data
         tournament_name = "Unknown League"
+        
+        # Try Stg (Stage) data first - this is the most reliable for Livescore
+        if "Stg" in match and isinstance(match["Stg"], dict):
+            stage = match["Stg"]
+            # Livescore uses "Nm" for stage name and "CompN" for competition name
+            tournament_name = stage.get("CompN") or stage.get("Nm") or "Unknown League"
+        elif "CompN" in match:
+            tournament_name = match.get("CompN")
+        elif "tournament" in match and isinstance(match["tournament"], dict):
+            tournament_name = match["tournament"].get("name") or "Unknown League"
+        elif "league" in match:
+            tournament_name = match.get("league")
+        
+        # Get country from actual data
         country_name = "World"
         country_slug = "world"
         
-        # Check for tournament data in various locations
-        if "tournament" in match:
-            tournament_data = match["tournament"]
-            if isinstance(tournament_data, dict):
-                tournament_name = tournament_data.get("name", "Unknown League")
-                # Get category/country data from tournament
-                if "category" in tournament_data:
-                    category_data = tournament_data["category"]
-                    if isinstance(category_data, dict):
-                        country_name = category_data.get("name", "World")
-                        country_slug = category_data.get("slug", country_name.lower())
-                        return tournament_name, country_name, country_slug
-        
-        # Check for direct stage data (from Livescore)
-        if "Stg" in match:
+        # Try Stg data first
+        if "Stg" in match and isinstance(match["Stg"], dict):
             stage = match["Stg"]
-            if isinstance(stage, dict):
-                tournament_name = stage.get("Nm", "Unknown League")
-                country_name = stage.get("Cnm", "World")
-                country_slug = country_name.lower()
-                if not country_name or country_name == "World":
-                    # Try to extract from tournament name
-                    if " - " in tournament_name:
-                        parts = tournament_name.split(" - ")
-                        country_name = parts[-1].strip() if len(parts) > 1 else "World"
-                        country_slug = country_name.lower()
-                return tournament_name, country_name, country_slug
-        
-        # Check for tournament data in flat fields
-        if "CompN" in match:
-            tournament_name = match.get("CompN", "Unknown League")
-        
-        # Check for country in flat fields
-        if "Cnm" in match:
+            # Livescore uses "Cnm" for country name, "Rgn" for region
+            country_name = stage.get("Cnm") or stage.get("Rgn") or stage.get("Country") or "World"
+            country_slug = country_name.lower()
+        elif "Cnm" in match:
             country_name = match.get("Cnm", "World")
-            country_slug = country_name.lower()
-        elif "Rgn" in match:
-            country_name = match.get("Rgn", "World")
-            country_slug = country_name.lower()
-        elif "Country" in match:
-            country_name = match.get("Country", "World")
             country_slug = country_name.lower()
         elif "country" in match and isinstance(match["country"], dict):
             country_data = match["country"]
-            country_name = country_data.get("name", "World")
-            country_slug = country_data.get("slug", country_name.lower())
-        
-        # If country is still "World", try to extract from tournament name
-        if country_name == "World" and " - " in tournament_name:
-            parts = tournament_name.split(" - ")
-            if len(parts) > 1:
-                potential_country = parts[-1].strip()
-                if len(potential_country) < 30:
-                    country_name = potential_country
-                    country_slug = country_name.lower()
-        elif country_name == "World" and " (" in tournament_name and ")" in tournament_name:
-            start = tournament_name.find("(")
-            end = tournament_name.find(")")
-            if start != -1 and end != -1:
-                potential_country = tournament_name[start+1:end].strip()
-                if len(potential_country) < 30:
-                    country_name = potential_country
-                    country_slug = country_name.lower()
+            country_name = country_data.get("name") or country_data.get("Cnm") or "World"
+            country_slug = country_data.get("slug") or country_name.lower()
         
         return tournament_name, country_name, country_slug
 
