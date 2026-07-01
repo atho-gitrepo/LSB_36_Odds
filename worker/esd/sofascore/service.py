@@ -67,7 +67,6 @@ class SofascoreService:
 
         for attempt in range(retries):
             try:
-                # Add light jitter variation to prevent precise behavioral signature tracking
                 if attempt > 0:
                     time.sleep(random.uniform(1.0, 2.5) * attempt)
 
@@ -89,51 +88,62 @@ class SofascoreService:
         return None
 
     def initialize(self):
-        """
-        Interface parity method ensuring compatibility with lifecycle controllers.
-        """
         if not self.session:
             self._init_session()
 
     def close(self):
-        """
-        Closes connection pools and cleans up network resources.
-        """
         if self.session:
             self.session.close()
             self.session = None
             self.logger.info("🧹 Service session connection adapters closed cleanly.")
 
     # ----------------------------------------------------------------------
-    # 🔄 DATA STRUCTURE TRANSLATION ADAPTER FOR LIVESCORE
+    # 🔄 DATA STRUCTURE TRANSLATION FOR LIVESCORE
     # ----------------------------------------------------------------------
     def _normalize_livescore_events(self, livescore_data: dict) -> list:
         """
         Transforms Livescore data structure to match what parse_events() expects.
+        Preserves all original field names from Livescore API.
         """
         extracted_events = []
         if not livescore_data or "Stages" not in livescore_data:
             return extracted_events
             
         for stage in livescore_data["Stages"]:
-            # Create a complete Stg object with all tournament data
+            # Preserve ALL stage data as-is from Livescore
             stage_data = {
-                "Nm": stage.get("Nm", "Unknown Tournament"),
-                "Tid": stage.get("Tid") or stage.get("CompId"),
-                "Cid": stage.get("Cid") or stage.get("CategoryId"),
-                "Cnm": stage.get("Cnm") or stage.get("Rgn") or stage.get("Country"),
-                "Ccd": stage.get("Ccd")
+                "Nm": stage.get("Nm"),           # Stage/Tournament name
+                "Tid": stage.get("Tid"),         # Tournament ID
+                "Cid": stage.get("Cid"),         # Category/Country ID  
+                "Cnm": stage.get("Cnm"),         # Category/Country Name
+                "Ccd": stage.get("Ccd"),         # Country Code
+                "Rgn": stage.get("Rgn"),         # Region
+                "CompN": stage.get("CompN"),     # Competition Name
+                "CompId": stage.get("CompId"),   # Competition ID
+                "Category": stage.get("Category") # Category object
             }
+            
+            # Remove None values to keep data clean
+            stage_data = {k: v for k, v in stage_data.items() if v is not None}
             
             for event in stage.get("Events", []):
                 # Attach the full stage data to the event
                 event["Stg"] = stage_data
+                
+                # Also promote key fields to event level for easier access
+                if "Cnm" in stage_data:
+                    event["Cnm"] = stage_data["Cnm"]
+                if "CompN" in stage_data:
+                    event["CompN"] = stage_data["CompN"]
+                if "Ccd" in stage_data:
+                    event["Ccd"] = stage_data["Ccd"]
+                
                 extracted_events.append(event)
                 
         return parse_events(extracted_events)
 
     # ----------------------------------------------------------------------
-    # ⚽ TRACKING CORE CAPABILITIES WITH ACTIVE AUTO-SWITCH OVER
+    # ⚽ TRACKING CORE CAPABILITIES WITH AUTO-SWITCH
     # ----------------------------------------------------------------------
     def get_live_events(self):
         try:
@@ -209,9 +219,6 @@ class SofascoreService:
             return {}
 
     def get_event(self, event_id: int) -> dict | None:
-        """
-        Fetch detailed event information for a specific match ID.
-        """
         try:
             url, params = self.endpoints.event_endpoint(int(event_id), provider="sofascore")
             data = self.safe_fetch_json(url, params, provider="sofascore")
@@ -229,9 +236,6 @@ class SofascoreService:
             return None
 
     def get_player(self, player_id: int) -> dict | None:
-        """
-        Fetch detailed player information for a specific player ID.
-        """
         try:
             url, params = self.endpoints.player_endpoint(int(player_id), provider="sofascore")
             data = self.safe_fetch_json(url, params, provider="sofascore")
@@ -249,9 +253,6 @@ class SofascoreService:
             return None
 
     def search(self, query: str, entity: str = "all") -> list:
-        """
-        Search for entities across both providers.
-        """
         results = []
         
         try:
