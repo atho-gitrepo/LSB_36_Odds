@@ -108,8 +108,14 @@ class SofascoreService:
         extracted_events = []
         if not livescore_data or "Stages" not in livescore_data:
             return extracted_events
-            
+        
+        self.logger.info(f"📊 Found {len(livescore_data['Stages'])} stages in Livescore response")
+        
         for stage in livescore_data["Stages"]:
+            # Log ALL fields in the stage to see what's available
+            self.logger.info(f"📋 Stage fields: {list(stage.keys())}")
+            self.logger.info(f"📋 Stage data: Nm={stage.get('Nm')}, CompN={stage.get('CompN')}, Cnm={stage.get('Cnm')}, Tid={stage.get('Tid')}")
+            
             # Preserve ALL stage data as-is from Livescore
             stage_data = {
                 "Nm": stage.get("Nm"),           # Stage/Tournament name
@@ -126,6 +132,17 @@ class SofascoreService:
             # Remove None values to keep data clean
             stage_data = {k: v for k, v in stage_data.items() if v is not None}
             
+            # If no CompN but there's a Category object, try to get it from there
+            if "CompN" not in stage_data and "Category" in stage:
+                category = stage["Category"]
+                if isinstance(category, dict):
+                    if "CompN" in category:
+                        stage_data["CompN"] = category["CompN"]
+                    if "Nm" in category and "Nm" not in stage_data:
+                        stage_data["Nm"] = category["Nm"]
+                    if "Cnm" in category and "Cnm" not in stage_data:
+                        stage_data["Cnm"] = category["Cnm"]
+            
             for event in stage.get("Events", []):
                 # Attach the full stage data to the event
                 event["Stg"] = stage_data
@@ -137,6 +154,8 @@ class SofascoreService:
                     event["CompN"] = stage_data["CompN"]
                 if "Ccd" in stage_data:
                     event["Ccd"] = stage_data["Ccd"]
+                if "Nm" in stage_data:
+                    event["Nm"] = stage_data["Nm"]
                 
                 extracted_events.append(event)
                 
