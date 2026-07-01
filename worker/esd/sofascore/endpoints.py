@@ -46,29 +46,19 @@ class HybridEndpoints:
                 "Cache-Control": "no-cache",
                 "Origin": "https://www.sofascore.com",
                 "Referer": "https://www.sofascore.com/",
-                "X-Sofascore-Client": "web"  # Critical header flag to bypass platform blocks
+                "X-Sofascore-Client": "web"
             },
             "timeout": 8.0
         }
 
     # --- Global / Live Event Endpoints ---
     def get_events_endpoint(self, date: str, provider: str = "sofascore") -> Tuple[str, Dict[str, Any]]:
-        """
-        SofaScore expects YYYY-MM-DD
-        LiveScore expects YYYYMMDD
-        Returns: (URL, QueryParameters)
-        """
         if provider == "livescore":
-            # Strip dashes if passed from system loop to fit YYYYMMDD structure
             sanitized_date = date.replace("-", "")
             return f"{self.live_base}/date/soccer/{sanitized_date}/0.00", {"MD": "1"}
         return f"{self.sofa_base}/sport/football/scheduled-events/{date}", {}
 
     def get_live_events_endpoint(self, provider: str = "sofascore") -> Tuple[str, Dict[str, Any]]:
-        """
-        Returns the endpoint URL and parameters for live events.
-        Returns: (URL, QueryParameters)
-        """
         if provider == "livescore":
             return f"{self.live_base}/live/soccer/0.00", {"MD": "1"}
         return f"{self.sofa_base}/sport/football/events/live", {}
