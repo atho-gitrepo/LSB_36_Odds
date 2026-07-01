@@ -76,54 +76,6 @@ def normalize_team_name(name: str) -> str:
     return clean_text(name)
 
 
-def extract_country_from_tournament(tournament_name: str) -> str | None:
-    """Extract country name from tournament name"""
-    if not tournament_name:
-        return None
-    
-    # Pattern: "Premier League - England"
-    if " - " in tournament_name:
-        parts = tournament_name.split(" - ")
-        if len(parts) > 1:
-            potential_country = parts[-1].strip()
-            if len(potential_country) < 30 and not potential_country.isdigit():
-                return potential_country
-    
-    # Pattern: "Premier League (England)"
-    if " (" in tournament_name and ")" in tournament_name:
-        start = tournament_name.find("(")
-        end = tournament_name.find(")")
-        if start != -1 and end != -1:
-            potential_country = tournament_name[start+1:end].strip()
-            if len(potential_country) < 30 and not potential_country.isdigit():
-                return potential_country
-    
-    # Pattern: "England - Premier League"
-    if " - " in tournament_name:
-        parts = tournament_name.split(" - ")
-        if len(parts) > 1:
-            potential_country = parts[0].strip()
-            if len(potential_country) < 30 and not potential_country.isdigit():
-                return potential_country
-    
-    # Common country names
-    common_countries = [
-        "England", "Spain", "Germany", "Italy", "France",
-        "Netherlands", "Portugal", "Belgium", "Turkey",
-        "Russia", "Ukraine", "Scotland", "Switzerland",
-        "Austria", "Denmark", "Sweden", "Norway", "Greece",
-        "Croatia", "Czech", "Poland", "United States",
-        "Mexico", "Argentina", "Brazil", "Australia",
-        "Japan", "South Korea", "Saudi Arabia", "Qatar"
-    ]
-    
-    for country in common_countries:
-        if country.lower() in tournament_name.lower():
-            return country
-    
-    return None
-
-
 # --------------------------------------------------
 # SAFE JSON FETCH (PLAYWRIGHT ONLY)
 # --------------------------------------------------
