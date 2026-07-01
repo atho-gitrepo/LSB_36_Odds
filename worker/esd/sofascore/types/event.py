@@ -168,43 +168,33 @@ def _parse_livescore_event(data: dict) -> Event:
     if "Stg" in data:
         stage = data["Stg"]
         
-        # Try all possible fields for tournament name
-        tournament_name = (
-            stage.get("CompN") or      # Competition Name (most common)
-            stage.get("Nm") or          # Stage Name
-            stage.get("name") or        # Generic name
-            stage.get("TournamentName") or
-            stage.get("LeagueName") or
-            "Unknown Tournament"
-        )
+        # CRITICAL FIX: Get tournament name from Snm (Stage Name)
+        # Snm is the actual tournament/league name in Livescore
+        tournament_name = stage.get("Snm")  # Stage Name - THIS IS THE TOURNAMENT NAME!
         
-        # If tournament name is "Unknown Tournament", check if there's a Category with name
-        if tournament_name == "Unknown Tournament" and "Category" in stage:
-            category = stage["Category"]
-            if isinstance(category, dict):
-                tournament_name = category.get("Nm") or category.get("Name") or "Unknown Tournament"
+        # If Snm is None, try other fields
+        if not tournament_name:
+            tournament_name = stage.get("CompN")  # Competition Name (World Cup, etc.)
+        if not tournament_name:
+            tournament_name = stage.get("Nm")  # Fallback
+        if not tournament_name:
+            tournament_name = "Unknown Tournament"
         
-        tournament_id = stage.get("Tid") or stage.get("CompId") or stage.get("id")
+        tournament_id = stage.get("Sid") or stage.get("CompId") or stage.get("Tid")
         
         # Extract country information directly from Livescore fields
         country_name = stage.get("Cnm")  # Livescore's country name field
         if not country_name:
             country_name = stage.get("Rgn")  # Region as fallback
         if not country_name:
-            country_name = stage.get("Country")  # Country as fallback
-        
-        # If country is still None, check Category object
-        if not country_name and "Category" in stage:
-            category = stage["Category"]
-            if isinstance(category, dict):
-                country_name = category.get("Nm") or category.get("Name")
+            country_name = "World"
         
         country_id = stage.get("Cid") or stage.get("CategoryId")
         country_code = stage.get("Ccd")
     
     # If no country data from stage, try event-level fields
-    if not country_name:
-        country_name = data.get("Cnm")
+    if not country_name or country_name == "World":
+        country_name = data.get("Cnm") or "World"
         country_id = data.get("Cid")
         country_code = data.get("Ccd")
     
