@@ -1,221 +1,305 @@
+"""
+Core business strategy processing engine.
+Evaluates live match metrics against staking parameters and logs execution telemetry.
+Hybrid version engineered to parse both object-oriented feeds and dictionary-based LiveScore payloads.
+"""
+
 import requests
 import os
 import json
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import firebase_admin
 from firebase_admin import credentials, firestore
 from esd.sofascore import SofascoreClient
 
-# --- LOGGING SETUP ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
-    handlers=[logging.FileHandler("bot_activity.log"), logging.StreamHandler()]
-)
-logger = logging.getLogger("BetBot")
+# Import shared metrics registry to prevent circular imports
+from metrics import STATE_LOCKS, BET_TRIGGERS, API_FAILURES
 
-# --- ENV VARS ---
+logger = logging.getLogger("BetBot.ExecutionEngine")
+
+# --- PARAMETERS & ENV EXTRACTION ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
 
-# --- SETTINGS ---
 ORIGINAL_STAKE = 10.0
 MAX_CHASE_LEVEL = 4
-SLEEP_TIME = 55  # ⚡ PITCH OPTIMIZED: Guarantees sampling inside the 3-minute window
 MINUTES_REGULAR_BET = [35, 36, 37]
+SLEEP_TIME = 55  # Default fallback sleep time between monitoring cycles
 
-# --- FILTERS ---
 AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u18', 'u17', 'u16', 'u19', 'u22', 'u23', 'u21', 'u20', 'women', 'college']
 
-# --- SMART OPTIMIZATION SETTINGS ---
-PREDICT_START_MIN = 30     # start tracking match early
-PRE_WARM_WINDOW = (34, 38) # only fully process in this window
-MATCH_CACHE = {}           # smart tracking cache
+PREDICT_START_MIN = 30     
+PRE_WARM_WINDOW = (34, 38) 
+MEMORY_PRUNE_TIMEOUT = 5400 
 
-# --- GLOBALS ---
-SOFASCORE_CLIENT = None
-firebase_manager = None
+# --- VOLATILE MEMORY CACHE MAP ---
 LOCAL_TRACKED_MATCHES = {}
 
+# --- FIXED GEOGRAPHICAL FLAG MAP ---
+COUNTRY_FLAGS = {
+    "iceland": "🇮🇸", "argentina": "🇦🇷", "england": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "germany": "🇩🇪",
+    "spain": "🇪🇸", "italy": "🇮🇹", "france": "🇫🇷", "brazil": "🇧🇷",
+    "malaysia": "🇲🇾", "belarus": "🇧🇾", "faroe islands": "🇫🇴",
+    "netherlands": "🇳🇱", "portugal": "🇵🇹", "belgium": "🇧🇪", "turkey": "🇹🇷",
+    "russia": "🇷🇺", "ukraine": "🇺🇦", "scotland": "🏴󠁧󠁢󠁳󠁣󠁴󠁿", "switzerland": "🇨🇭",
+    "austria": "🇦🇹", "denmark": "🇩🇰", "sweden": "🇸🇪", "norway": "🇳🇴",
+    "greece": "🇬🇷", "croatia": "🇭🇷", "poland": "🇵🇱", "united states": "🇺🇸",
+    "mexico": "🇲🇽", "australia": "🇦🇺", "japan": "🇯🇵", "south korea": "🇰🇷",
+    "saudi arabia": "🇸🇦", "qatar": "🇶🇦", "uae": "🇦🇪", "china": "🇨🇳",
+    "egypt": "🇪🇬", "nigeria": "🇳🇬", "south africa": "🇿🇦", "chile": "🇨🇱",
+    "colombia": "🇨🇴", "peru": "🇵🇪", "uruguay": "🇺🇾", "paraguay": "🇵🇾",
+    "ecuador": "🇪🇨", "venezuela": "🇻🇪", "bolivia": "🇧🇴", "costarica": "🇨🇷"
+}
+
 # =========================
-# FIREBASE MANAGER
+# FIREBASE CONFIGURATION
 # =========================
 class FirebaseManager:
     def __init__(self, creds_json):
+        self.creds_json = creds_json
         self.db = None
-        if not creds_json:
+        self._connect()
+
+    def _connect(self):
+        if not self.creds_json:
             logger.error("❌ Firebase Credentials missing from environment variables!")
-            return
+            return False
         try:
-            logger.info("Parsing Firebase credential JSON...")
-            cred_dict = json.loads(creds_json)
+            cred_dict = json.loads(self.creds_json)
             cred = credentials.Certificate(cred_dict)
             if not firebase_admin._apps:
                 firebase_admin.initialize_app(cred)
-                logger.info("Initializing new Firebase App connection.")
             self.db = firestore.client()
             logger.info("✅ Firebase Connection Successfully Established.")
+            return True
         except Exception as e:
             logger.exception(f"❌ Firebase Initialization Error: {e}")
+            self.db = None
+            return False
 
-    def is_state_locked(self):
-        logger.debug("Checking Firebase for unresolved locks...")
+    def _ensure_connection(self) -> bool:
+        if self.db is not None:
+            return True
+        return self._connect()
+
+    def is_state_locked(self) -> bool:
+        if not self._ensure_connection():
+            return True
         try:
             unresolved_docs = self.db.collection('unresolved_bets').limit(1).get()
-            is_locked = len(unresolved_docs) > 0
-            if is_locked:
-                logger.warning("🔒 Firebase state lock detected. Active bet sequence is outstanding.")
-            else:
-                logger.debug("🔓 No state lock found. Ready for new bets.")
-            return is_locked
+            return len(unresolved_docs) > 0
         except Exception as e:
             logger.error(f"❌ Error checking Firebase state lock: {e}")
-            return True  # Fallback to locked to prevent duplicate betting on DB error
+            return True 
 
-    def get_last_resolved_bet(self):
-        logger.info("Fetching last resolved bet to determine progression sequence...")
+    def get_last_resolved_bet(self) -> dict | None:
+        if not self._ensure_connection():
+            return None
         try:
             query = self.db.collection('resolved_bets')\
                 .order_by('resolution_timestamp', direction=firestore.Query.DESCENDING)\
                 .limit(1).get()
-            
             for doc in query:
-                bet_data = doc.to_dict()
-                logger.info(f"📋 Last resolved bet found: ID {doc.id} | Outcome: {bet_data.get('outcome')} | Seq: {bet_data.get('match_sequence')}")
-                return bet_data
-            
-            logger.info("📋 No historical resolved bets discovered. Fresh progression path starting.")
+                return doc.to_dict()
             return None
         except Exception as e:
             logger.exception(f"❌ Error pulling last resolved bet: {e}")
             return None
 
-    def add_unresolved_bet(self, match_id, data):
-        placed_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    def add_unresolved_bet(self, match_id: str, data: dict):
+        placed_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         data['placed_at'] = placed_time
-        logger.info(f"💾 Saving unresolved bet to Firebase: Match ID {match_id} | Data: {data}")
+        if not self._ensure_connection():
+            logger.critical(f"❌ Transmit Blocked: Database offline. Drop ID {match_id}!")
+            return
         try:
             self.db.collection('unresolved_bets').document(str(match_id)).set(data)
             logger.info(f"✅ Document successfully written to 'unresolved_bets' for ID {match_id}")
         except Exception as e:
             logger.exception(f"❌ Critical: Failed to save unresolved bet for ID {match_id}: {e}")
 
-    def get_unresolved_bet(self, match_id):
-        logger.debug(f"🔍 Checking document store for unresolved match ID: {match_id}")
+    def get_unresolved_bet(self, match_id: str) -> dict | None:
+        if not self._ensure_connection():
+            return None
         try:
             doc = self.db.collection('unresolved_bets').document(str(match_id)).get()
-            if doc.exists:
-                logger.info(f"🎯 Unresolved bet data loaded for Match ID {match_id}")
-                return doc.to_dict()
-            logger.debug(f"No unresolved bet record exists for Match ID {match_id}")
-            return None
+            return doc.to_dict() if doc.exists else None
         except Exception as e:
             logger.error(f"❌ Error downloading unresolved document {match_id}: {e}")
             return None
 
-    def move_to_resolved(self, match_id, data, outcome):
-        resolved_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    def move_to_resolved(self, match_id: str, data: dict, outcome: str) -> bool:
+        resolved_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         data.update({
             'outcome': outcome,
             'resolved_at': resolved_time,
             'resolution_timestamp': firestore.SERVER_TIMESTAMP
         })
-        logger.info(f"🔄 Migrating Match ID {match_id} from unresolved -> resolved. Outcome: {outcome.upper()}")
+        if not self._ensure_connection():
+            return False
         try:
             self.db.collection('resolved_bets').document(str(match_id)).set(data)
-            logger.info(f"✅ Added to 'resolved_bets' collection for ID {match_id}")
             self.db.collection('unresolved_bets').document(str(match_id)).delete()
-            logger.info(f"✅ Dropped from 'unresolved_bets' collection for ID {match_id}")
             return True
         except Exception as e:
             logger.exception(f"❌ Error during database migration lifecycle for Match ID {match_id}: {e}")
             return False
 
 # =========================
-# TELEGRAM COMMUNICATOR
+# SYSTEM UTILITY AGENTS
 # =========================
-def send_telegram(msg):
+def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    logger.info(f"📱 Dispatching Telegram Message Alert...")
-    logger.debug(f"Telegram Text Payload: [ {msg} ]")
     try:
-        response = requests.post(
-            url,
-            data={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'},
-            timeout=15
-        )
-        if response.status_code == 200:
-            logger.info("📱 Telegram alert successfully received by Telegram Gateway API Server.")
-        else:
-            logger.warning(f"⚠️ Telegram returned abnormal response status code: {response.status_code} | Body: {response.text}")
+        requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'}, timeout=15)
     except Exception as e:
-        logger.error(f"❌ Network/Timeout error sending Telegram webhook event: {e}")
+        logger.error(f"❌ Network error sending Telegram webhook event: {e}")
 
-# =========================
-# WAGER MANAGEMENT
-# =========================
-def calculate_stake():
-    logger.info("Calculating next staking allocation multiplier...")
+def calculate_stake() -> tuple[float, int]:
     last = firebase_manager.get_last_resolved_bet()
-    
-    if not last:
-        logger.info(f"Staking default path: No history. Initializing Base Stake: ${ORIGINAL_STAKE} (Sequence #1)")
-        return ORIGINAL_STAKE, 1
-        
-    outcome = last.get('outcome')
-    if outcome == 'win':
-        logger.info(f"Staking default path: Prior bet was a WIN. Resetting to Base Stake: ${ORIGINAL_STAKE} (Sequence #1)")
+    if not last or last.get('outcome') == 'win':
         return ORIGINAL_STAKE, 1
         
     seq = last.get('match_sequence', 1)
     if seq < MAX_CHASE_LEVEL:
-        chase_stake = float(ORIGINAL_STAKE * (2**seq))
-        next_seq = seq + 1
-        logger.warning(f"⚠️ Staking progression path: Prior bet was a LOSS. Progressing to Chase Level {next_seq} | New Calculated Stake: ${chase_stake:.2f}")
-        return chase_stake, next_seq
+        return float(ORIGINAL_STAKE * (2**seq)), seq + 1
         
-    logger.error(f"🚨 CRITICAL: Sequence hit maximum progression limit ({MAX_CHASE_LEVEL}). Hard reset back to Sequence #1. Absorbing loss of tier levels.")
+    logger.error(f"🚨 MAX CHASE TIER HIT ({MAX_CHASE_LEVEL}). Hard reset back to sequence base configurations.")
     return ORIGINAL_STAKE, 1
 
-# =========================
-# SMART PREDICTION LOGIC
-# =========================
-def should_pre_warm(minute):
-    decision = minute >= PREDICT_START_MIN
-    logger.debug(f"Smart Engine Assessment: Minute {minute} >= Threshold {PREDICT_START_MIN}? Result: {decision}")
-    return decision
+def prune_volatile_cache_leaks():
+    current_time = time.time()
+    stale_keys = [
+        fid for fid, state in LOCAL_TRACKED_MATCHES.items()
+        if current_time - state.get('last_seen', 0.0) > MEMORY_PRUNE_TIMEOUT
+    ]
+    for key in stale_keys:
+        LOCAL_TRACKED_MATCHES.pop(key, None)
+    if stale_keys:
+        logger.info(f"🧹 Automated Memory Clean: Evicted {len(stale_keys)} stale match contexts from memory maps.")
 
-def is_in_active_window(minute):
-    decision = PRE_WARM_WINDOW[0] <= minute <= PRE_WARM_WINDOW[1]
-    logger.debug(f"Smart Engine Window Bracket Assessment: Minute {minute} inside {PRE_WARM_WINDOW}? Result: {decision}")
-    return decision
+# ==========================================
+# HYBRID PARSING WRAPPER FOR GEOGRAPHY - FIXED
+# ==========================================
+def extract_hybrid_geography(match) -> tuple[str, str, str]:
+    """
+    Resolves league and country data structures across both 
+    Sofascore object types and LiveScore payload mappings.
+    Returns: (league_name, country_name, country_slug)
+    """
+    # 1. Handle object-oriented payload formats (Sofascore)
+    if hasattr(match, 'tournament'):
+        league = match.tournament.name
+        country_name = match.tournament.category.name if match.tournament.category else "World"
+        country_slug = getattr(match.tournament.category, 'slug', country_name.lower())
+        return league, country_name, country_slug
+
+    # 2. Handle structural dictionary payload formats (LiveScore)
+    if isinstance(match, dict):
+        # 🎯 FIX: Properly extract tournament data from Livescore event
+        tournament_name = "Unknown League"
+        country_name = "World"
+        country_slug = "world"
+        
+        # Check for tournament data in various locations
+        if "tournament" in match:
+            tournament_data = match["tournament"]
+            if isinstance(tournament_data, dict):
+                tournament_name = tournament_data.get("name", "Unknown League")
+                # Get category/country data from tournament
+                if "category" in tournament_data:
+                    category_data = tournament_data["category"]
+                    if isinstance(category_data, dict):
+                        country_name = category_data.get("name", "World")
+                        country_slug = category_data.get("slug", country_name.lower())
+                        return tournament_name, country_name, country_slug
+        
+        # Check for direct stage data (from Livescore)
+        if "Stg" in match:
+            stage = match["Stg"]
+            if isinstance(stage, dict):
+                tournament_name = stage.get("Nm", "Unknown League")
+                country_name = stage.get("Cnm", "World")
+                country_slug = country_name.lower()
+                if not country_name or country_name == "World":
+                    # Try to extract from tournament name
+                    if " - " in tournament_name:
+                        parts = tournament_name.split(" - ")
+                        country_name = parts[-1].strip() if len(parts) > 1 else "World"
+                        country_slug = country_name.lower()
+                return tournament_name, country_name, country_slug
+        
+        # Check for tournament data in flat fields
+        if "CompN" in match:
+            tournament_name = match.get("CompN", "Unknown League")
+        
+        # Check for country in flat fields
+        if "Cnm" in match:
+            country_name = match.get("Cnm", "World")
+            country_slug = country_name.lower()
+        elif "Rgn" in match:
+            country_name = match.get("Rgn", "World")
+            country_slug = country_name.lower()
+        elif "Country" in match:
+            country_name = match.get("Country", "World")
+            country_slug = country_name.lower()
+        elif "country" in match and isinstance(match["country"], dict):
+            country_data = match["country"]
+            country_name = country_data.get("name", "World")
+            country_slug = country_data.get("slug", country_name.lower())
+        
+        # If country is still "World", try to extract from tournament name
+        if country_name == "World" and " - " in tournament_name:
+            parts = tournament_name.split(" - ")
+            if len(parts) > 1:
+                potential_country = parts[-1].strip()
+                if len(potential_country) < 30:
+                    country_name = potential_country
+                    country_slug = country_name.lower()
+        elif country_name == "World" and " (" in tournament_name and ")" in tournament_name:
+            start = tournament_name.find("(")
+            end = tournament_name.find(")")
+            if start != -1 and end != -1:
+                potential_country = tournament_name[start+1:end].strip()
+                if len(potential_country) < 30:
+                    country_name = potential_country
+                    country_slug = country_name.lower()
+        
+        return tournament_name, country_name, country_slug
+
+    return "Unknown League", "World", "world"
 
 # =========================
-# CORE MATCH LOGIC PIPELINE
+# CORE EVALUATION PIPELINE
 # =========================
 def process_match(match):
-    fid = str(match.id)
-    league = match.tournament.name
-    country = match.tournament.category.name
-    full_info = f"{league} {country}".lower()
-    match_name = f"{match.home_team.name} vs {match.away_team.name}"
+    # Safe fallback lookup for Unique IDs and Match Titles
+    fid = str(match.id) if hasattr(match, 'id') else str(match.get('match_id') or match.get('id') or match.get('Eid', ''))
+    
+    if hasattr(match, 'home_team'):
+        match_name = f"{match.home_team.name} vs {match.away_team.name}"
+    else:
+        match_name = match.get('match_name') or f"{match.get('home_name', 'Home')} vs {match.get('away_name', 'Away')}"
 
-    logger.debug(f"Processing Match Input Feed: '{match_name}' (ID: {fid})")
+    # Extract dynamic structural metadata using the hybrid tracker
+    league, country, country_slug = extract_hybrid_geography(match)
+    full_info = f"{league} {country}"
 
-    # Filter validations
-    if any(keyword.lower() in full_info for keyword in AMATEUR_KEYWORDS):
-        logger.debug(f"⏩ Dropping match '{match_name}' ({fid}). Matched restricted amateur keyword constraint rules.")
+    if any(keyword.lower() in full_info.lower() for keyword in AMATEUR_KEYWORDS):
+        logger.debug(f"⏭️ Skipping amateur match: {match_name} ({full_info})")
         return
 
-    status = match.status.description.upper()
-    score = f"{match.home_score.current}-{match.away_score.current}"
+    # Extract score matrices and status descriptions safely
+    if hasattr(match, 'status'):
+        status = match.status.description.upper()
+        score = f"{match.home_score.current}-{match.away_score.current}"
+    else:
+        status = str(match.get('status_string') or match.get('status') or match.get('Eps', '')).upper()
+        score = f"{match.get('home_score', 0)}-{match.get('away_score', 0)}"
 
-    # =========================================================================
-    # 🎯 FIX: EXCLUSIVE FOCUS ON LIVE MATCH PITCH TIME ONLY
-    # =========================================================================
     live_pitch_minute = None
     is_first_half_phase = False
 
@@ -223,27 +307,18 @@ def process_match(match):
         live_pitch_minute = int(status)
         if live_pitch_minute <= 45:
             is_first_half_phase = True
-    elif status == 'HT' or 'HALFTIME' in status or 'HALF' in status:
+    elif status in ['HT', 'HALFTIME', 'HALF']:
         live_pitch_minute = 45
         is_first_half_phase = True
     elif '1ST' in status:
         is_first_half_phase = True
-        live_pitch_minute = match.total_elapsed_minutes  # fallback calculation only if digital block missing
+        live_pitch_minute = getattr(match, 'total_elapsed_minutes', match.get('total_elapsed_minutes', 35))
 
-    # If the live pitch time could not be parsed, or it's clearly a 2nd half status string, ignore it.
-    if live_pitch_minute is None:
-        logger.debug(f"⏩ Skipping match processing '{match_name}' ({fid}). Cannot determine live pitch minute from status: {status}")
+    if live_pitch_minute is None or live_pitch_minute < PREDICT_START_MIN:
         return
 
-    # Optimization Filter Gate (Now strictly tracking actual pitch minutes)
-    if not should_pre_warm(live_pitch_minute):
-        logger.debug(f"⏩ Skipping match processing '{match_name}' ({fid}). Live pitch clock {live_pitch_minute}' sits below tracking threshold.")
-        return  
+    logger.info(f"🔍 Match verification: {match_name} | Real Min: {live_pitch_minute}' | Score: {score} | League: {league} | Country: {country}")
 
-    # CLEAN LOGS: Output relies entirely on the precise physical match timer
-    logger.info(f"🔍 Analyzing match state: {match_name} | Live Min: {live_pitch_minute}' | Score: {score} | Status: {status}")
-
-    # Synchronize internal tracking dictionary state updates
     state = LOCAL_TRACKED_MATCHES.get(fid, {
         'bet_placed': False,
         'last_seen': time.time(),
@@ -251,157 +326,107 @@ def process_match(match):
     })
     state['last_seen'] = time.time()
 
-    if is_in_active_window(live_pitch_minute):
-        if not state['active']:
-            logger.info(f"🔥 Match '{match_name}' has entered its active target evaluation window.")
+    if PRE_WARM_WINDOW[0] <= live_pitch_minute <= PRE_WARM_WINDOW[1]:
         state['active'] = True
 
     LOCAL_TRACKED_MATCHES[fid] = state
 
-    # =========================================================================
-    # PHASE 1: BET PLACEMENT EVALUATION (STRICT LIVE PITCH TIME ONLY)
-    # =========================================================================
+    # --- PHASE 1: EVALUATE PLACEMENT ---
     if is_first_half_phase and (live_pitch_minute in MINUTES_REGULAR_BET) and not state['bet_placed']:
-        logger.info(f"🎯 Execution Target Window Hit for '{match_name}' (Live Pitch Min: {live_pitch_minute}'). Checking qualification criteria...")
-        
         if firebase_manager.is_state_locked():
-            logger.warning(f"🚫 Qualification rejected for '{match_name}'. System is locked awaiting another unresolved wager resolution event.")
+            STATE_LOCKS.inc()  
+            logger.warning(f"🚫 Qualification blocked for '{match_name}'. Active DB lock present.")
         else:
-            logger.info(f"Target system metrics passed. Confirming score value line compatibility: [ {score} ]")
             if score in ['1-1', '2-2', '2-1', '2-0']:
-                logger.warning(f"⚡ MATCH QUALIFIED! Placing bet on '{match_name}' at live pitch minute {live_pitch_minute}' with live score line {score}!")
-                
+                logger.warning(f"⚡ QUALIFIED: Firing placement routine for {match_name} at score {score}")
                 stake, seq = calculate_stake()
+                
+                # Fetch matching country emoji flag using the normalized low-case string slug
+                flag_emoji = COUNTRY_FLAGS.get(country_slug.lower(), COUNTRY_FLAGS.get(country.lower(), "🌍"))
+
                 data = {
                     'match_name': match_name,
                     'league': league,
+                    'country': country,
+                    'country_slug': country_slug,
                     '36_score': score,
                     'stake': stake,
                     'match_sequence': seq,
                     'bet_type': 'regular'
                 }
-
                 firebase_manager.add_unresolved_bet(fid, data)
+                BET_TRIGGERS.inc()  
+                
+                # Enhanced clean Telegram string notification alert layout
                 send_telegram(
-                    f"🎯 **BET PLACED (Match {seq})**\n⏱ Real Min: {live_pitch_minute}' | {match_name}\n🌍 {country} | 🏆 {league}\n🔢 Score: {score}\n💰 Stake: ${stake:.2f}"
+                    f"🎯 **BET PLACED (Match {seq})**\n"
+                    f"⏱ Min: {live_pitch_minute}' | {match_name}\n"
+                    f"{flag_emoji} {country} | 🏆 {league}\n"
+                    f"🔢 Score: {score}\n"
+                    f"💰 Stake: ${stake:.2f}"
                 )
-            else:
-                logger.info(f"❌ Score condition pattern did not meet rules for '{match_name}' (Score: {score}). Skipping bet trigger.")
-
+        
         state['bet_placed'] = True
         LOCAL_TRACKED_MATCHES[fid] = state
 
-    # =========================
-    # PHASE 2: HALFTIME VALUE CHECK
-    # =========================
-    elif status == 'HT' or 'HALFTIME' in status:
-        logger.debug(f"Match context state indicates HALFTIME status for ID {fid}. Querying resolution tracking flags...")
+    # --- PHASE 2: HALFTIME RESOLUTION ---
+    elif status in ['HT', 'HALFTIME', 'HALF']:
         unresolved = firebase_manager.get_unresolved_bet(fid)
-
         if unresolved:
-            logger.info(f"🏁 Evaluating pending bet resolution for match '{match_name}'...")
             trigger_score = unresolved.get('36_score')
+            outcome = 'win' if score == trigger_score else 'loss'
             
-            if score == trigger_score:
-                outcome = 'win'
-                logger.warning(f"✅ WIN VERIFIED! Halftime score matches tracking parameters ({score} == {trigger_score}) for '{match_name}'.")
-            else:
-                outcome = 'loss'
-                logger.warning(f"❌ LOSS VERIFIED! Halftime score diverged from tracking parameters ({score} != {trigger_score}) for '{match_name}'.")
-                
+            db_league = unresolved.get('league', league)
+            db_country = unresolved.get('country', country)
+            db_slug = unresolved.get('country_slug', country_slug)
+            flag_emoji = COUNTRY_FLAGS.get(db_slug.lower(), COUNTRY_FLAGS.get(db_country.lower(), "🌍"))
+
             firebase_manager.move_to_resolved(fid, unresolved, outcome)
+            
             send_telegram(
-                f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} HT\n{match_name}\nScore: {score}"
+                f"{'✅ WIN' if outcome == 'win' else '❌ LOSS'} **HT Settlement**\n"
+                f"⏱ 45' | {match_name}\n"
+                f"{flag_emoji} {db_country} | 🏆 {db_league}\n"
+                f"🔢 Score: {score}"
             )
-
-            # Purge from memory maps
             LOCAL_TRACKED_MATCHES.pop(fid, None)
-            logger.info(f"🧹 Cleaned match entry ID {fid} from volatile memory maps.")
 
 # =========================
-# SERVICE LIFECYCLE MANAGEMENT
+# DRIVER LAYER INTERFACES
 # =========================
-def initialize_bot_services():
+def initialize_bot_services() -> bool:
     global firebase_manager, SOFASCORE_CLIENT
-    logger.info("Initializing background processing services...")
-    
     firebase_manager = FirebaseManager(FIREBASE_CREDENTIALS)
-
     try:
-        logger.info("Instantiating headless connection interfaces for Sofascore client driver layers...")
         SOFASCORE_CLIENT = SofascoreClient()
         SOFASCORE_CLIENT.initialize()
-        logger.info("✅ Background Sofascore scraping context driver initialized successfully.")
         return True
     except Exception as e:
-        logger.exception(f"❌ Failed to spin up system components or network bindings: {e}")
+        logger.exception(f"❌ Failed to instantiate data engine driver context: {e}")
+        API_FAILURES.inc()
         return False
 
 def shutdown_bot():
-    logger.warning("Application shutdown lifecycle initiated.")
+    global SOFASCORE_CLIENT
     if SOFASCORE_CLIENT:
         try:
-            logger.info("Closing active driver ports and browser sessions safely...")
             SOFASCORE_CLIENT.close()
-            logger.info("✅ Driver connections terminated cleanly.")
         except Exception as e:
-            logger.error(f"❌ Error caught closing service contexts during shutdown: {e}")
+            logger.error(f"Error shutting down client: {e}")
 
-# =========================
-# PERIODIC LOOP INSTANCE
-# =========================
 def run_bot_cycle():
     if not SOFASCORE_CLIENT:
-        logger.error("Skipping scraping cycle execution: Sofascore driver interface object is uninitialized or dead.")
         return
-
     try:
-        logger.info("Requesting live matches event feed array from underlying data services...")
         events = SOFASCORE_CLIENT.get_events(live=True)
-
         if not events:
-            logger.warning("⚠️ Received empty response array structure from client query endpoint framework.")
+            logger.debug("No live events found in current cycle.")
             return
-
-        logger.info(f"🔄 Scan metrics updated: Tracking {len(events)} real-time live events. Dispatching evaluations...")
-
         for m in events:
             try:
                 process_match(m)
             except Exception as inner_ex:
-                logger.error(f"❌ Exception caught processing evaluation steps for single index node: {inner_ex}", exc_info=True)
-
+                logger.error(f"Error checking single event match node: {inner_ex}")
+        prune_volatile_cache_leaks()
     except Exception as e:
-        logger.error(f"💥 Runtime Exception error caught running central execution script loops: {e}", exc_info=True)
-
-# =========================
-# APPLICATION INSTANTIATION
-# =========================
-if __name__ == "__main__":
-    logger.info("=" * 60)
-    logger.info("🚀 BETTING STRATEGY BOT INITIALIZATION SEQUENCE STARTING")
-    logger.info("=" * 60)
-    
-    if not initialize_bot_services():
-        logger.critical("❌ Core systems boot dependency failure. Program terminating.")
-        exit(1)
-        
-    cycle_counter = 0
-    try:
-        while True:
-            cycle_counter += 1
-            logger.info(f"🏁 --- EXECUTION RUNNING FOR CYCLE INTERVAL BLOCK #{cycle_counter} ---")
-            
-            run_bot_cycle()
-            
-            logger.info(f"Memory Diagnostics: Currently monitoring {len(LOCAL_TRACKED_MATCHES)} matches inside internal maps.")
-            logger.info(f"💤 Cycle completed. Putting application thread to sleep for {SLEEP_TIME} seconds...")
-            time.sleep(SLEEP_TIME)
-            
-    except KeyboardInterrupt:
-        logger.warning("🛑 Key-interruption event triggered by host administrator console. Terminating bot loops.")
-    except Exception as fatal_ex:
-        logger.critical(f"💥 System crashed from fatal root application thread breakdown exception: {fatal_ex}", exc_info=True)
-    finally:
-        shutdown_bot()
-        logger.info("👋 Engine terminated. Execution stream closed.")
+        logger.error(f"Ingestion lifecycle exception: {e}")
