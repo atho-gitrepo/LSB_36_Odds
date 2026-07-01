@@ -168,15 +168,23 @@ def _parse_livescore_event(data: dict) -> Event:
     if "Stg" in data:
         stage = data["Stg"]
         
-        # Extract tournament/competition name - Livescore uses "Nm" for stage name
-        # and "CompN" for competition name
-        tournament_name = stage.get("Nm", "Unknown Tournament")
+        # Try all possible fields for tournament name
+        tournament_name = (
+            stage.get("CompN") or      # Competition Name (most common)
+            stage.get("Nm") or          # Stage Name
+            stage.get("name") or        # Generic name
+            stage.get("TournamentName") or
+            stage.get("LeagueName") or
+            "Unknown Tournament"
+        )
         
-        # If there's a more specific competition name, use it
-        if stage.get("CompN"):
-            tournament_name = stage.get("CompN")
+        # If tournament name is "Unknown Tournament", check if there's a Category with name
+        if tournament_name == "Unknown Tournament" and "Category" in stage:
+            category = stage["Category"]
+            if isinstance(category, dict):
+                tournament_name = category.get("Nm") or category.get("Name") or "Unknown Tournament"
         
-        tournament_id = stage.get("Tid") or stage.get("CompId")
+        tournament_id = stage.get("Tid") or stage.get("CompId") or stage.get("id")
         
         # Extract country information directly from Livescore fields
         country_name = stage.get("Cnm")  # Livescore's country name field
@@ -185,8 +193,14 @@ def _parse_livescore_event(data: dict) -> Event:
         if not country_name:
             country_name = stage.get("Country")  # Country as fallback
         
+        # If country is still None, check Category object
+        if not country_name and "Category" in stage:
+            category = stage["Category"]
+            if isinstance(category, dict):
+                country_name = category.get("Nm") or category.get("Name")
+        
         country_id = stage.get("Cid") or stage.get("CategoryId")
-        country_code = stage.get("Ccd")  # Livescore's country code
+        country_code = stage.get("Ccd")
     
     # If no country data from stage, try event-level fields
     if not country_name:
@@ -206,7 +220,7 @@ def _parse_livescore_event(data: dict) -> Event:
     tournament_data = {
         "id": tournament_id,
         "name": tournament_name,
-        "slug": tournament_name.lower().replace(" ", "-") if tournament_name else "unknown",
+        "slug": tournament_name.lower().replace(" ", "-") if tournament_name and tournament_name != "Unknown Tournament" else "unknown",
         "category": category_data
     }
 
