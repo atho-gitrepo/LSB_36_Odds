@@ -191,7 +191,7 @@ def extract_hybrid_geography(match) -> tuple[str, str, str]:
     Sofascore object types and LiveScore payload mappings.
     Returns: (league_name, country_name, country_slug)
     
-    Uses actual data from the API responses, not keyword guessing.
+    Uses actual data from the API responses.
     """
     # 1. Handle object-oriented payload formats (Sofascore)
     if hasattr(match, 'tournament'):
@@ -208,14 +208,28 @@ def extract_hybrid_geography(match) -> tuple[str, str, str]:
         # Try Stg (Stage) data first - this is the most reliable for Livescore
         if "Stg" in match and isinstance(match["Stg"], dict):
             stage = match["Stg"]
-            # Livescore uses "Nm" for stage name and "CompN" for competition name
-            tournament_name = stage.get("CompN") or stage.get("Nm") or "Unknown League"
-        elif "CompN" in match:
-            tournament_name = match.get("CompN")
-        elif "tournament" in match and isinstance(match["tournament"], dict):
-            tournament_name = match["tournament"].get("name") or "Unknown League"
-        elif "league" in match:
-            tournament_name = match.get("league")
+            # Try all possible fields for tournament name
+            tournament_name = (
+                stage.get("CompN") or      # Competition Name
+                stage.get("Nm") or          # Stage Name
+                stage.get("name") or
+                "Unknown League"
+            )
+            
+            # If still unknown, check Category
+            if tournament_name == "Unknown League" and "Category" in stage:
+                category = stage["Category"]
+                if isinstance(category, dict):
+                    tournament_name = category.get("Nm") or category.get("Name") or "Unknown League"
+        
+        # If no Stg data, try direct fields
+        if tournament_name == "Unknown League":
+            tournament_name = (
+                match.get("CompN") or
+                match.get("league") or
+                match.get("tournament") or
+                "Unknown League"
+            )
         
         # Get country from actual data
         country_name = "World"
@@ -224,16 +238,22 @@ def extract_hybrid_geography(match) -> tuple[str, str, str]:
         # Try Stg data first
         if "Stg" in match and isinstance(match["Stg"], dict):
             stage = match["Stg"]
-            # Livescore uses "Cnm" for country name, "Rgn" for region
-            country_name = stage.get("Cnm") or stage.get("Rgn") or stage.get("Country") or "World"
+            country_name = (
+                stage.get("Cnm") or
+                stage.get("Rgn") or
+                stage.get("Country") or
+                "World"
+            )
             country_slug = country_name.lower()
-        elif "Cnm" in match:
-            country_name = match.get("Cnm", "World")
+        
+        # If no country from Stg, try direct fields
+        if country_name == "World":
+            country_name = (
+                match.get("Cnm") or
+                match.get("country") or
+                "World"
+            )
             country_slug = country_name.lower()
-        elif "country" in match and isinstance(match["country"], dict):
-            country_data = match["country"]
-            country_name = country_data.get("name") or country_data.get("Cnm") or "World"
-            country_slug = country_data.get("slug") or country_name.lower()
         
         return tournament_name, country_name, country_slug
 
