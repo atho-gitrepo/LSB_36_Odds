@@ -29,7 +29,7 @@ MAX_CHASE_LEVEL = 4
 MINUTES_REGULAR_BET = [35, 36, 37]
 SLEEP_TIME = 55  # Default fallback sleep time between monitoring cycles
 
-AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves', 'friendly', 'u18', 'u17', 'u16', 'u19', 'u22', 'u23', 'u21', 'u20', 'women', 'college']
+AMATEUR_KEYWORDS = ['amateur', 'youth', 'reserves','u18', 'u17', 'u16', 'u19', 'u22', 'u23', 'u21', 'u20','college']
 
 PREDICT_START_MIN = 30     
 PRE_WARM_WINDOW = (34, 38) 
