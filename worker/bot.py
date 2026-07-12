@@ -25,7 +25,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
 
 ORIGINAL_STAKE = 10.0
-MAX_CHASE_LEVEL = 4
+MAX_CHASE_LEVEL = 2
 MINUTES_REGULAR_BET = [35, 36, 37]
 SLEEP_TIME = 55  # Default fallback sleep time between monitoring cycles
 
@@ -323,7 +323,7 @@ def process_match(match):
             STATE_LOCKS.inc()  
             logger.warning(f"🚫 Qualification blocked for '{match_name}'. Active DB lock present.")
         else:
-            if score in ['1-1', '2-2', '2-1', '2-0']:
+            if score in ['1-1', '2-2', '2-1', '2-0','0-2','1-2']:
                 logger.warning(f"⚡ QUALIFIED: Firing placement routine for {match_name} at score {score}")
                 stake, seq = calculate_stake()
                 
