@@ -48,6 +48,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ----------------------------------------------------
 # 5. 🔥 CRITICAL FIX: INSTALL PLAYWRIGHT BROWSERS
 # ----------------------------------------------------
+# ✅ Install playwright package FIRST, then install browsers
 RUN playwright install chromium
 
 # ----------------------------------------------------
