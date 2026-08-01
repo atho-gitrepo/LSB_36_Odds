@@ -323,7 +323,7 @@ def process_match(match):
             STATE_LOCKS.inc()  
             logger.warning(f"🚫 Qualification blocked for '{match_name}'. Active DB lock present.")
         else:
-            if score in ['1-1', '2-2', '0-0', '2-0','0-2']:
+            if score in ['1-1', '2-2', '2-0','0-2']:
                 logger.warning(f"⚡ QUALIFIED: Firing placement routine for {match_name} at score {score}")
                 stake, seq = calculate_stake()
                 
